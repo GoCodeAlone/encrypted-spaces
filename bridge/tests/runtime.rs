@@ -6,19 +6,31 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
+use std::sync::mpsc;
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 const PROTOCOL_VERSION: u64 = 1;
 const UPSTREAM_COMMIT: &str = "4cda0ae87698135aa672990e6e68cf7873847426";
 const RUST_TOOLCHAIN: &str = "1.94.1";
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
+const EXIT_TIMEOUT: Duration = Duration::from_secs(2);
+
+enum StdoutEvent {
+    Line(String),
+    Eof,
+    Error(String),
+}
 
 struct BridgeProcess {
     child: Child,
     stdin: Option<ChildStdin>,
-    stdout: BufReader<ChildStdout>,
+    stdout: mpsc::Receiver<StdoutEvent>,
+    stdout_thread: Option<JoinHandle<()>>,
     scenario: String,
     next_request: usize,
-    schema_path: PathBuf,
+    schema_path: Option<PathBuf>,
 }
 
 impl BridgeProcess {
@@ -42,14 +54,37 @@ impl BridgeProcess {
             .spawn()
             .expect("spawn bridge");
         let stdin = child.stdin.take().expect("bridge stdin");
-        let stdout = BufReader::new(child.stdout.take().expect("bridge stdout"));
+        let stdout = child.stdout.take().expect("bridge stdout");
+        let (stdout_sender, stdout_receiver) = mpsc::channel();
+        let stdout_thread = thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(0) => {
+                        let _ = stdout_sender.send(StdoutEvent::Eof);
+                        break;
+                    }
+                    Ok(_) => {
+                        if stdout_sender.send(StdoutEvent::Line(line)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = stdout_sender.send(StdoutEvent::Error(error.to_string()));
+                        break;
+                    }
+                }
+            }
+        });
         Self {
             child,
             stdin: Some(stdin),
-            stdout,
+            stdout: stdout_receiver,
+            stdout_thread: Some(stdout_thread),
             scenario: format!("{scenario}-{actor}"),
             next_request: 1,
-            schema_path,
+            schema_path: Some(schema_path),
         }
     }
 
@@ -93,14 +128,19 @@ impl BridgeProcess {
         writeln!(stdin, "{frame}").expect("write bridge frame");
         stdin.flush().expect("flush bridge frame");
 
-        let mut line = String::new();
-        self.stdout
-            .read_line(&mut line)
-            .expect("read bridge response");
-        assert!(
-            !line.is_empty(),
-            "bridge exited before responding to {operation}"
-        );
+        let line = match self.stdout.recv_timeout(RESPONSE_TIMEOUT) {
+            Ok(StdoutEvent::Line(line)) => line,
+            Ok(StdoutEvent::Eof) => panic!("bridge exited before responding to {operation}"),
+            Ok(StdoutEvent::Error(error)) => {
+                panic!("bridge stdout read failed while handling {operation}: {error}")
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                panic!("bridge did not respond to {operation} within {RESPONSE_TIMEOUT:?}")
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("bridge stdout reader disconnected while handling {operation}")
+            }
+        };
         let response = serde_json::from_str(&line).expect("bridge response JSON");
         Observation {
             operation: operation.to_owned(),
@@ -109,11 +149,54 @@ impl BridgeProcess {
         }
     }
 
+    fn wait_for_exit(&mut self) -> ExitStatus {
+        let deadline = Instant::now() + EXIT_TIMEOUT;
+        loop {
+            if let Some(status) = self.child.try_wait().expect("poll bridge process") {
+                return status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "bridge did not exit within {EXIT_TIMEOUT:?}"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn join_reader(&mut self) {
+        if let Some(thread) = self.stdout_thread.take() {
+            thread.join().expect("join bridge stdout reader");
+        }
+    }
+
+    fn remove_schema_fixture(&mut self) {
+        if let Some(path) = self.schema_path.take() {
+            fs::remove_file(path).expect("remove bridge schema fixture");
+        }
+    }
+
     fn finish(mut self) {
-        drop(self.stdin.take());
-        let status = self.child.wait().expect("wait for bridge");
-        fs::remove_file(&self.schema_path).expect("remove bridge schema fixture");
+        self.stdin.take();
+        let status = self.wait_for_exit();
+        self.join_reader();
+        self.remove_schema_fixture();
         assert!(status.success(), "bridge exited with {status}");
+    }
+}
+
+impl Drop for BridgeProcess {
+    fn drop(&mut self) {
+        self.stdin.take();
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+        if let Some(thread) = self.stdout_thread.take() {
+            let _ = thread.join();
+        }
+        if let Some(path) = self.schema_path.take() {
+            let _ = fs::remove_file(path);
+        }
     }
 }
 
@@ -223,6 +306,29 @@ impl Scenario {
         }
     }
 
+    fn verify_error<T, F>(&mut self, index: usize, validate: F)
+    where
+        T: DeserializeOwned,
+        F: FnOnce(&T) -> Result<(), String>,
+    {
+        let observation = &self.observations[index];
+        let failure = match observation.response.get("ok").and_then(Value::as_bool) {
+            Some(false) => match observation.response.get("error") {
+                Some(error) => match serde_json::from_value::<T>(error.clone()) {
+                    Ok(error) => validate(&error).err(),
+                    Err(error) => Some(format!("typed error mismatch: {error}")),
+                },
+                None => Some("missing typed error".to_owned()),
+            },
+            Some(true) => Some("expected typed error, received success".to_owned()),
+            None => Some("missing boolean ok field".to_owned()),
+        };
+        if let Some(failure) = failure {
+            self.failures
+                .push(format!("{}: {failure}", observation.operation));
+        }
+    }
+
     fn finish(mut self) {
         for (_, bridge) in std::mem::take(&mut self.bridges) {
             bridge.finish();
@@ -297,6 +403,11 @@ struct TableInsertResult {
 #[derive(Deserialize)]
 struct TableSelectResult {
     rows: Vec<Value>,
+}
+
+#[derive(Deserialize)]
+struct BridgeError {
+    code: String,
 }
 
 #[derive(Deserialize)]
@@ -589,7 +700,30 @@ fn runtime_space_lifecycle_is_red() {
     let invite_value =
         scenario.returned_value(invite, "invite", json!({"missing": "lifecycle-invite"}));
     let join = scenario.request(member, "space.join", join_payload(invite_value));
+    let sync_label = "post-join-sync-parametric";
+    let sync_rank = 307;
+    let sync_insert = scenario.request(
+        owner,
+        "table.insert",
+        json!({
+            "space_id": space_id,
+            "table": TABLE,
+            "row": parent_row(sync_label, sync_rank),
+        }),
+    );
+    let sync_row_id = scenario.observations[sync_insert].response["result"]["row_id"]
+        .as_i64()
+        .unwrap_or(-1);
     let sync = scenario.request(member, "space.sync", json!({"space_id": space_id}));
+    let synced_select = scenario.request(
+        member,
+        "table.select",
+        json!({
+            "space_id": space_id,
+            "table": TABLE,
+            "where": {"id": sync_row_id},
+        }),
+    );
     let remove = scenario.request(
         owner,
         "member.remove",
@@ -646,10 +780,20 @@ fn runtime_space_lifecycle_is_red() {
             .then_some(())
             .ok_or_else(|| "space.join did not consume the returned invite".to_owned())
     });
+    scenario.verify::<TableInsertResult, _>(sync_insert, |result| {
+        (result.row_id > 0)
+            .then_some(())
+            .ok_or_else(|| "post-join sync fixture row has no auto-assigned ID".to_owned())
+    });
     scenario.verify::<SyncResult, _>(sync, |result| {
         (result.space_id == space_id && result.synced)
             .then_some(())
             .ok_or_else(|| "space.sync did not report a completed sync".to_owned())
+    });
+    scenario.verify::<TableSelectResult, _>(synced_select, |result| {
+        (result.rows.len() == 1 && row_matches(&result.rows[0], sync_row_id, sync_label, sync_rank))
+            .then_some(())
+            .ok_or_else(|| "space.sync did not expose the owner's post-join row".to_owned())
     });
     scenario.verify::<RemoveResult, _>(remove, |result| {
         (result.space_id == space_id && result.member_id == member_id && result.removed)
@@ -896,7 +1040,7 @@ fn runtime_file_put_get_are_red() {
 }
 
 #[test]
-fn runtime_member_invite_space_join_remove_are_red() {
+fn runtime_member_invite_join_remove_are_red() {
     let owner = "owner-membership-parametric";
     let member = "member-membership-parametric";
     let mut scenario = Scenario::start("membership", &[owner, member]);
@@ -908,11 +1052,52 @@ fn runtime_member_invite_space_join_remove_are_red() {
         .unwrap_or(-1);
     let invite_value =
         scenario.returned_value(invite, "invite", json!({"missing": "membership-invite"}));
-    let join = scenario.request(member, "space.join", join_payload(invite_value));
+    let join = scenario.request(member, "member.join", join_payload(invite_value));
+    let retained_label = "owner-retained-after-removal-parametric";
+    let retained_rank = 401;
+    let retained_insert = scenario.request(
+        owner,
+        "table.insert",
+        json!({
+            "space_id": space_id,
+            "table": TABLE,
+            "row": parent_row(retained_label, retained_rank),
+        }),
+    );
+    let retained_row_id = scenario.observations[retained_insert].response["result"]["row_id"]
+        .as_i64()
+        .unwrap_or(-1);
     let remove = scenario.request(
         owner,
         "member.remove",
         json!({"space_id": space_id, "member_id": member_id}),
+    );
+    let removed_select = scenario.request(
+        member,
+        "table.select",
+        json!({
+            "space_id": space_id,
+            "table": TABLE,
+            "where": {"id": retained_row_id},
+        }),
+    );
+    let removed_write = scenario.request(
+        member,
+        "table.insert",
+        json!({
+            "space_id": space_id,
+            "table": TABLE,
+            "row": parent_row("removed-member-write-parametric", 409),
+        }),
+    );
+    let owner_select = scenario.request(
+        owner,
+        "table.select",
+        json!({
+            "space_id": space_id,
+            "table": TABLE,
+            "where": {"id": retained_row_id},
+        }),
     );
 
     scenario.verify::<SpaceCreateResult, _>(create_space, |result| {
@@ -928,12 +1113,38 @@ fn runtime_member_invite_space_join_remove_are_red() {
     scenario.verify::<JoinResult, _>(join, |result| {
         (result.space_id == space_id && result.member_id == member_id && result.joined)
             .then_some(())
-            .ok_or_else(|| "space.join did not join the invited SDK member".to_owned())
+            .ok_or_else(|| "member.join did not join the invited SDK member".to_owned())
+    });
+    scenario.verify::<TableInsertResult, _>(retained_insert, |result| {
+        (result.row_id > 0)
+            .then_some(())
+            .ok_or_else(|| "removal fixture row has no auto-assigned ID".to_owned())
     });
     scenario.verify::<RemoveResult, _>(remove, |result| {
         (result.space_id == space_id && result.member_id == member_id && result.removed)
             .then_some(())
             .ok_or_else(|| "member.remove did not remove the joined member".to_owned())
+    });
+    scenario.verify_error::<BridgeError, _>(removed_select, |error| {
+        (error.code == "ACCESS_DENIED")
+            .then_some(())
+            .ok_or_else(|| "removed member select did not return ACCESS_DENIED".to_owned())
+    });
+    scenario.verify_error::<BridgeError, _>(removed_write, |error| {
+        (error.code == "ACCESS_DENIED")
+            .then_some(())
+            .ok_or_else(|| "removed member write did not return ACCESS_DENIED".to_owned())
+    });
+    scenario.verify::<TableSelectResult, _>(owner_select, |result| {
+        (result.rows.len() == 1
+            && row_matches(
+                &result.rows[0],
+                retained_row_id,
+                retained_label,
+                retained_rank,
+            ))
+        .then_some(())
+        .ok_or_else(|| "owner could not read the row after member removal".to_owned())
     });
     scenario.finish();
 }
