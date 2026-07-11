@@ -523,7 +523,10 @@ impl Runtime {
             return invalid_state(request_id);
         }
         let table = space.table::<Value>(&payload.table);
-        match self.executor.block_on(table.insert(&payload.row).execute()) {
+        match self.executor.block_on(async {
+            space.sync().await?;
+            table.insert(&payload.row).execute().await
+        }) {
             Ok(row_id) => Response::success(request_id, TableInsertResult { row_id }),
             Err(error) => sdk_operation_error(request_id, &error),
         }
@@ -557,10 +560,10 @@ impl Runtime {
             return invalid_request(request_id);
         }
         let table = space.table::<Value>(&payload.table);
-        match self
-            .executor
-            .block_on(table.select().where_eq(&column, value).all())
-        {
+        match self.executor.block_on(async {
+            space.sync().await?;
+            table.select().where_eq(&column, value).all().await
+        }) {
             Ok(rows) => Response::success(request_id, TableSelectResult { rows }),
             Err(error) => sdk_operation_error(request_id, &error),
         }
@@ -1079,4 +1082,126 @@ fn required_env(name: &str) -> io::Result<String> {
         .ok()
         .filter(|value| !value.is_empty())
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, format!("{name} is required")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use encrypted_spaces_sdk::{ColumnType, SchemaBuilder};
+    use serde_json::json;
+
+    fn revoked_member_runtime() -> (Runtime, String, i64) {
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let (member, space_id, row_id, data_commitment_bytes) = executor.block_on(async {
+            let schema = SchemaBuilder::new("records")
+                .column("id", ColumnType::Integer)
+                .plaintext_primary_key()
+                .column("label", ColumnType::Text)
+                .expect("label column")
+                .build()
+                .expect("records schema");
+            let transport = LocalTransport::new(std::slice::from_ref(&schema), None, Some(1024))
+                .await
+                .expect("local transport");
+            let data_commitment = transport.get_root_hash().await.expect("initial root");
+            let schema_bundle = || {
+                ApplicationSchema::WithDataCommitment(
+                    vec![schema.clone()],
+                    data_commitment,
+                    encrypted_spaces_ffproof::EXTEND_FF_ID,
+                )
+            };
+            let owner = Space::create(transport.clone(), schema_bundle())
+                .await
+                .expect("owner space");
+            let invite = owner.invite_user().await.expect("member invite");
+            let member = Space::join(transport.clone(), invite, schema_bundle())
+                .await
+                .expect("member join");
+            let member_id = member.uid().expect("member ID") as i64;
+
+            owner.sync().await.expect("owner join sync");
+            let row_id = owner
+                .table::<Value>("records")
+                .insert(&json!({"label": "cached-before-revocation"}))
+                .execute()
+                .await
+                .expect("owner insert");
+            member.sync().await.expect("member row sync");
+            let cached = member
+                .table::<Value>("records")
+                .select()
+                .where_eq("id", row_id)
+                .all()
+                .await
+                .expect("warm member cache");
+            assert_eq!(cached.len(), 1, "member cache fixture");
+
+            owner.remove_user(member_id).await.expect("remove member");
+            (member, owner.id().to_string(), row_id, data_commitment)
+        });
+        let data_commitment = data_commitment_bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let runtime = Runtime {
+            executor,
+            process: ProcessConfig {
+                actor_id: "revoked-member".to_owned(),
+                schema_sha256: "test-schema".to_owned(),
+                schema: Vec::new(),
+                data_commitment_bytes,
+                data_commitment,
+                ff_guest_image_id: encrypted_spaces_ffproof::EXTEND_FF_ID,
+                backend_url: "local-test".to_owned(),
+            },
+            space: Some(member),
+            shutdown_requested: false,
+        };
+
+        (runtime, space_id, row_id)
+    }
+
+    #[test]
+    fn table_select_syncs_revocation_before_cache_access() {
+        let (mut runtime, space_id, row_id) = revoked_member_runtime();
+
+        let response = runtime.table_select(
+            "revoked-select".to_owned(),
+            json!({
+                "space_id": space_id,
+                "table": "records",
+                "where": {"id": row_id},
+            }),
+        );
+
+        assert!(!response.ok, "revoked member read stale cached row");
+        assert_eq!(
+            response.error.as_ref().map(|error| error.code),
+            Some("ACCESS_DENIED")
+        );
+    }
+
+    #[test]
+    fn table_insert_syncs_revocation_before_write() {
+        let (mut runtime, space_id, _) = revoked_member_runtime();
+
+        let response = runtime.table_insert(
+            "revoked-insert".to_owned(),
+            json!({
+                "space_id": space_id,
+                "table": "records",
+                "row": {"label": "write-after-revocation"},
+            }),
+        );
+
+        assert!(!response.ok, "revoked member wrote after removal");
+        assert_eq!(
+            response.error.as_ref().map(|error| error.code),
+            Some("ACCESS_DENIED")
+        );
+    }
 }

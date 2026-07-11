@@ -103,6 +103,9 @@ fn backend_binary() -> &'static Path {
     static BINARY: OnceLock<PathBuf> = OnceLock::new();
     BINARY
         .get_or_init(|| {
+            if let Some(path) = std::env::var_os("ENCRYPTED_SPACES_BACKEND_TEST_BINARY") {
+                return PathBuf::from(path);
+            }
             let root = Path::new(env!("CARGO_MANIFEST_DIR"))
                 .parent()
                 .expect("workspace root");
@@ -176,7 +179,10 @@ impl BridgeProcess {
             actor
         ));
         fs::write(&schema_path, schema).expect("write bridge schema fixture");
-        let mut command = Command::new(env!("CARGO_BIN_EXE_encrypted-spaces-bridge"));
+        let bridge_binary = std::env::var_os("ENCRYPTED_SPACES_BRIDGE_TEST_BINARY")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_encrypted-spaces-bridge")));
+        let mut command = Command::new(bridge_binary);
         command
             .env("ENCRYPTED_SPACES_ACTOR_ID", actor)
             .env("ENCRYPTED_SPACES_SCHEMA_PATH", &schema_path)
@@ -699,6 +705,16 @@ fn sdk_data_commitment(schema: &str, suffix: &str) -> String {
         .collect()
 }
 
+fn expected_ff_guest_id() -> Vec<u32> {
+    match std::env::var("ENCRYPTED_SPACES_EXPECTED_FF_GUEST_ID") {
+        Ok(value) => value
+            .split(',')
+            .map(|word| word.parse::<u32>().expect("guest image ID word"))
+            .collect(),
+        Err(_) => encrypted_spaces_ffproof::EXTEND_FF_ID.to_vec(),
+    }
+}
+
 fn is_opaque_ref(value: &Value) -> bool {
     match value {
         Value::Null => false,
@@ -773,7 +789,7 @@ fn runtime_hello_health_metadata_is_process_bound() {
 
     let expected_commitment = sdk_data_commitment(SCHEMA_KDL, "stable");
     let changed_commitment = sdk_data_commitment(&modified_schema, "changed");
-    let expected_guest_id = encrypted_spaces_ffproof::EXTEND_FF_ID.to_vec();
+    let expected_guest_id = expected_ff_guest_id();
 
     for response in [&first_response, &second_response, &changed_response] {
         assert_eq!(response["ok"], true, "hello trust metadata failed");
