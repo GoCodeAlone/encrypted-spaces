@@ -61,30 +61,51 @@ pub fn run<R: Read, W: Write>(reader: R, mut writer: W) -> io::Result<()> {
             Err(FrameError::Io(error)) => return Err(error),
         };
 
-        let response = parse_request(&frame);
+        let response = match decode_request(&frame) {
+            Ok(request) => runtime::dispatch(request),
+            Err(response) => response,
+        };
         write_response(&mut writer, response)?;
     }
 }
 
-fn parse_request(frame: &[u8]) -> Response {
+fn decode_request(frame: &[u8]) -> Result<Request, Response> {
     let value = match serde_json::from_slice::<Value>(frame) {
         Ok(value) => value,
-        Err(_) => return Response::error(None, "INVALID_JSON", "malformed JSONL frame"),
+        Err(_) => {
+            return Err(Response::error(
+                None,
+                "INVALID_JSON",
+                "malformed JSONL frame",
+            ));
+        }
     };
     let request_id = parsed_request_id(&value);
     if has_unknown_operation(&value) {
-        return Response::error(request_id, "UNKNOWN_OPERATION", "unknown bridge operation");
+        return Err(Response::error(
+            request_id,
+            "UNKNOWN_OPERATION",
+            "unknown bridge operation",
+        ));
     }
 
     let request = match serde_json::from_value::<Request>(value) {
         Ok(request) => request,
         Err(_) => {
-            return Response::error(request_id, "INVALID_REQUEST", "invalid bridge request");
+            return Err(Response::error(
+                request_id,
+                "INVALID_REQUEST",
+                "invalid bridge request",
+            ));
         }
     };
     match request.validate() {
-        Ok(()) => runtime::dispatch(request),
-        Err(_) => Response::error(request_id, "INVALID_REQUEST", "invalid bridge request"),
+        Ok(()) => Ok(request),
+        Err(_) => Err(Response::error(
+            request_id,
+            "INVALID_REQUEST",
+            "invalid bridge request",
+        )),
     }
 }
 
@@ -131,4 +152,23 @@ fn write_response<W: Write>(writer: &mut W, response: Response) -> io::Result<()
     serde_json::to_writer(&mut *writer, &response).map_err(io::Error::other)?;
     writer.write_all(b"\n")?;
     writer.flush()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn protocol_decode_accepts_valid_and_correlates_invalid_requests() {
+        let valid = br#"{"version":1,"request_id":"decode-ok","operation":"hello","payload":{}}"#;
+        let request = decode_request(valid).expect("valid request");
+        assert_eq!(request.request_id, "decode-ok");
+        assert!(matches!(request.operation, Operation::Hello));
+
+        let invalid =
+            br#"{"version":2,"request_id":"decode-invalid","operation":"hello","payload":{}}"#;
+        let response = decode_request(invalid).expect_err("invalid version");
+        assert_eq!(response.request_id.as_deref(), Some("decode-invalid"));
+        assert_eq!(response.error.expect("error body").code, "INVALID_REQUEST");
+    }
 }
