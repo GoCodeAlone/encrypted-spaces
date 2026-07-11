@@ -3,14 +3,12 @@ use serde_json::Value;
 
 pub const PROTOCOL_VERSION: u16 = 1;
 pub const MAX_REQUEST_ID_BYTES: usize = 256;
-pub const MAX_ACTOR_ID_BYTES: usize = 256;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Request {
     pub version: u16,
     pub request_id: String,
-    pub actor_id: String,
     pub operation: Operation,
     #[serde(default)]
     pub payload: Value,
@@ -23,9 +21,6 @@ impl Request {
         }
         if self.request_id.is_empty() || self.request_id.len() > MAX_REQUEST_ID_BYTES {
             return Err("request id exceeds maximum size");
-        }
-        if self.actor_id.is_empty() || self.actor_id.len() > MAX_ACTOR_ID_BYTES {
-            return Err("actor id exceeds maximum size");
         }
         Ok(())
     }

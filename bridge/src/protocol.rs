@@ -1,6 +1,7 @@
 use crate::runtime;
-use crate::schema::{Request, PROTOCOL_VERSION};
+use crate::schema::{Operation, Request, MAX_REQUEST_ID_BYTES, PROTOCOL_VERSION};
 use serde::Serialize;
+use serde_json::Value;
 use std::io::{self, BufRead, Read, Write};
 
 pub const MAX_FRAME_BYTES: usize = 64 * 1024;
@@ -55,20 +56,53 @@ pub fn run<R: Read, W: Write>(reader: R, mut writer: W) -> io::Result<()> {
                     &mut writer,
                     Response::error(None, "FRAME_TOO_LARGE", "JSONL frame exceeds maximum size"),
                 )?;
-                continue;
+                return Ok(());
             }
             Err(FrameError::Io(error)) => return Err(error),
         };
 
-        let response = match serde_json::from_slice::<Request>(&frame) {
-            Ok(request) => match request.validate() {
-                Ok(()) => runtime::dispatch(request),
-                Err(_) => Response::error(None, "INVALID_REQUEST", "invalid bridge request"),
-            },
-            Err(_) => Response::error(None, "INVALID_JSON", "malformed JSONL frame"),
-        };
+        let response = parse_request(&frame);
         write_response(&mut writer, response)?;
     }
+}
+
+fn parse_request(frame: &[u8]) -> Response {
+    let value = match serde_json::from_slice::<Value>(frame) {
+        Ok(value) => value,
+        Err(_) => return Response::error(None, "INVALID_JSON", "malformed JSONL frame"),
+    };
+    let request_id = parsed_request_id(&value);
+    if has_unknown_operation(&value) {
+        return Response::error(request_id, "UNKNOWN_OPERATION", "unknown bridge operation");
+    }
+
+    let request = match serde_json::from_value::<Request>(value) {
+        Ok(request) => request,
+        Err(_) => {
+            return Response::error(request_id, "INVALID_REQUEST", "invalid bridge request");
+        }
+    };
+    match request.validate() {
+        Ok(()) => runtime::dispatch(request),
+        Err(_) => Response::error(request_id, "INVALID_REQUEST", "invalid bridge request"),
+    }
+}
+
+fn has_unknown_operation(value: &Value) -> bool {
+    value
+        .get("operation")
+        .and_then(Value::as_str)
+        .is_some_and(|operation| {
+            serde_json::from_value::<Operation>(Value::String(operation.to_owned())).is_err()
+        })
+}
+
+fn parsed_request_id(value: &Value) -> Option<String> {
+    value
+        .get("request_id")
+        .and_then(Value::as_str)
+        .filter(|request_id| !request_id.is_empty() && request_id.len() <= MAX_REQUEST_ID_BYTES)
+        .map(str::to_owned)
 }
 
 fn read_frame<R: BufRead>(reader: &mut R) -> Result<Option<Vec<u8>>, FrameError> {
@@ -87,12 +121,6 @@ fn read_frame<R: BufRead>(reader: &mut R) -> Result<Option<Vec<u8>>, FrameError>
             return Ok(Some(frame));
         }
         if frame.len() == MAX_FRAME_BYTES {
-            loop {
-                let read = reader.read(&mut byte).map_err(FrameError::Io)?;
-                if read == 0 || byte[0] == b'\n' {
-                    break;
-                }
-            }
             return Err(FrameError::TooLarge);
         }
         frame.push(byte[0]);
