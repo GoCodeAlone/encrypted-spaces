@@ -149,9 +149,14 @@ fn read_frame<R: BufRead>(reader: &mut R) -> Result<Option<Vec<u8>>, FrameError>
 }
 
 fn write_response<W: Write>(writer: &mut W, response: Response) -> io::Result<()> {
-    serde_json::to_writer(&mut *writer, &response).map_err(io::Error::other)?;
-    writer.write_all(b"\n")?;
+    writer.write_all(&encode_response(&response)?)?;
     writer.flush()
+}
+
+fn encode_response(response: &Response) -> io::Result<Vec<u8>> {
+    let mut frame = serde_json::to_vec(response).map_err(io::Error::other)?;
+    frame.push(b'\n');
+    Ok(frame)
 }
 
 #[cfg(test)]
@@ -170,5 +175,19 @@ mod tests {
         let response = decode_request(invalid).expect_err("invalid version");
         assert_eq!(response.request_id.as_deref(), Some("decode-invalid"));
         assert_eq!(response.error.expect("error body").code, "INVALID_REQUEST");
+    }
+
+    #[test]
+    fn protocol_encode_emits_one_redacted_jsonl_frame() {
+        let response = Response::error(
+            Some("encode-request".to_owned()),
+            "INVALID_REQUEST",
+            "invalid bridge request",
+        );
+        let encoded = encode_response(&response).expect("encode response");
+        assert_eq!(
+            encoded,
+            b"{\"version\":1,\"request_id\":\"encode-request\",\"ok\":false,\"error\":{\"code\":\"INVALID_REQUEST\",\"message\":\"invalid bridge request\"}}\n"
+        );
     }
 }
