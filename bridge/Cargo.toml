@@ -1,0 +1,15 @@
+[package]
+name = "encrypted-spaces-bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Bounded JSONL runtime bridge boundary for encrypted spaces"
+
+[[bin]]
+name = "encrypted-spaces-bridge"
+path = "src/main.rs"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true

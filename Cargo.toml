@@ -4,6 +4,7 @@ members = [
     "backend/acl-types",
     "backend/server",
     "backend/storage-encoding",
+    "bridge",
     "demos/tauri/src-tauri",
     "demos/tauri/test-harness",
     "crypto",

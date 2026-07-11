@@ -2244,6 +2244,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "encrypted-spaces-bridge"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "encrypted-spaces-changelog-core"
 version = "0.0.1"
 dependencies = [

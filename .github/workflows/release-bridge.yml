@@ -1,0 +1,106 @@
+name: Bridge Release Contract
+
+# Contract-only RED workflow. It validates the future public release shape but
+# does not publish releases and does not claim release readiness yet.
+# release_ready: false
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+env:
+  RELEASE_READY: false
+  UPSTREAM_COMMIT: 4cda0ae87698135aa672990e6e68cf7873847426
+  RUST_VERSION: 1.94.1
+  RISC0_SKIP_BUILD: 1
+  PROVENANCE: required-before-publish
+
+jobs:
+  contract:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout pinned upstream descendant
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate public release contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$RELEASE_READY" = false
+          git merge-base --is-ancestor "$UPSTREAM_COMMIT" "$GITHUB_SHA"
+          grep -Fq 'kdl = { version = "=6.5.0"' Cargo.toml
+          grep -Fq 'version = "6.5.0"' Cargo.lock
+          test -f LICENSE
+          # NOTICE is a deliberate release gate until the legal attribution
+          # file is supplied; this workflow must stay RED before publishing.
+          test -f NOTICE
+          test -f PATCHES.md
+          grep -Fq "$UPSTREAM_COMMIT" PATCHES.md
+          grep -Fq '800495f' PATCHES.md
+          grep -Fq "Rust $RUST_VERSION" PATCHES.md
+
+      - name: Install pinned Rust toolchain and expose matching tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          RUSTC="$(rustup which --toolchain "$RUST_VERSION" rustc)"
+          RUSTDOC="$(rustup which --toolchain "$RUST_VERSION" rustdoc)"
+          echo "RUSTUP_TOOLCHAIN=$RUST_VERSION" >> "$GITHUB_ENV"
+          echo "RUSTC=$RUSTC" >> "$GITHUB_ENV"
+          echo "RUSTDOC=$RUSTDOC" >> "$GITHUB_ENV"
+          echo "$(dirname "$RUSTC")" >> "$GITHUB_PATH"
+          "$RUSTC" --version
+          "$RUSTDOC" --version
+
+      - name: Validate build and publication markers
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -Fq 'sha256sum' .github/workflows/release-bridge.yml
+          grep -Fq 'shasum -a 256' .github/workflows/release-bridge.yml
+          grep -Fq 'provenance' .github/workflows/release-bridge.yml
+          grep -Fq 'LICENSE' .github/workflows/release-bridge.yml
+          grep -Fq 'NOTICE' .github/workflows/release-bridge.yml
+          grep -Fq 'does not publish' .github/workflows/release-bridge.yml
+
+  assets:
+    needs: contract
+    if: ${{ false }}
+    strategy:
+      matrix:
+        include:
+          - component: backend
+            os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - component: backend
+            os: ubuntu-24.04
+            target: aarch64-unknown-linux-gnu
+          - component: backend
+            os: macos-13
+            target: x86_64-apple-darwin
+          - component: backend
+            os: macos-14
+            target: aarch64-apple-darwin
+          - component: bridge
+            os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - component: bridge
+            os: ubuntu-24.04
+            target: aarch64-unknown-linux-gnu
+          - component: bridge
+            os: macos-13
+            target: x86_64-apple-darwin
+          - component: bridge
+            os: macos-14
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Future asset contract
+        run: |
+          echo "${{ matrix.component }}-${{ matrix.target }}"
+          echo "checksums: sha256sum / shasum -a 256"
+          echo "provenance: $PROVENANCE"

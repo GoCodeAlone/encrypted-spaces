@@ -10,6 +10,11 @@
     "filter": ""
   },
   {
+    "group": "bridge",
+    "packages": "-p encrypted-spaces-bridge",
+    "filter": ""
+  },
+  {
     "group": "sdk",
     "packages": "-p encrypted-spaces-sdk -p encrypted-spaces-sdk-fuzzer",
     "filter": "-E 'not test(/fuzz_smoke/)'"
