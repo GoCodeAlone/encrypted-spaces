@@ -51,8 +51,14 @@ fn red_operation(operation: &str) {
 }
 
 #[test]
-fn runtime_create_join_snapshot_restore_sync_are_red() {
-    for operation in ["create", "join", "snapshot", "restore", "sync"] {
+fn runtime_space_lifecycle_is_red() {
+    for operation in [
+        "space.create",
+        "space.join",
+        "space.snapshot",
+        "space.restore",
+        "space.sync",
+    ] {
         red_operation(operation);
     }
 }
@@ -93,7 +99,7 @@ fn runtime_member_invite_join_remove_are_red() {
 }
 
 #[test]
-fn runtime_release_contract_is_present_but_not_ready() {
+fn release_contract_is_red_until_dist_and_notice_exist() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
     let workflow = std::fs::read_to_string(root.join(".github/workflows/release-bridge.yml"))
         .expect("release contract workflow");
@@ -106,15 +112,30 @@ fn runtime_release_contract_is_present_but_not_ready() {
     for asset in ["backend", "bridge"] {
         assert!(workflow.contains(asset), "workflow omits {asset} asset");
     }
-    for target in [
-        "x86_64-unknown-linux-gnu",
-        "aarch64-unknown-linux-gnu",
-        "x86_64-apple-darwin",
-        "aarch64-apple-darwin",
-    ] {
+    for target in ["linux-amd64", "linux-arm64", "macos-amd64", "macos-arm64"] {
         assert!(workflow.contains(target), "workflow omits {target}");
     }
+    for archive in [
+        "encrypted-spaces-backend-linux-amd64.tar.gz",
+        "encrypted-spaces-backend-linux-arm64.tar.gz",
+        "encrypted-spaces-backend-macos-amd64.tar.gz",
+        "encrypted-spaces-backend-macos-arm64.tar.gz",
+        "encrypted-spaces-bridge-linux-amd64.tar.gz",
+        "encrypted-spaces-bridge-linux-arm64.tar.gz",
+        "encrypted-spaces-bridge-macos-amd64.tar.gz",
+        "encrypted-spaces-bridge-macos-arm64.tar.gz",
+    ] {
+        assert!(workflow.contains(archive), "workflow omits {archive}");
+    }
     for marker in [
+        "DIST_CONTRACT: dist",
+        "actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683",
+        "test -s \"$manifest\"",
+        "test -s \"$archive\"",
+        "test -s \"$checksum\"",
+        "test -s \"$provenance\"",
+        "test -s \"$license\"",
+        "test -s \"$notice\"",
         "sha256sum",
         "provenance",
         "LICENSE",
@@ -128,6 +149,9 @@ fn runtime_release_contract_is_present_but_not_ready() {
             "workflow omits release marker {marker}"
         );
     }
+    assert!(!workflow.contains("if: ${{ false }}"));
+    assert!(!workflow.contains("echo \"${{ matrix.component }}-${{ matrix.target }}\""));
+    assert!(!workflow.contains("Future asset contract"));
     assert!(workflow.contains("release_ready: false"));
     assert!(workflow.contains("does not publish"));
     assert!(matrix.contains("encrypted-spaces-bridge"));
@@ -136,4 +160,26 @@ fn runtime_release_contract_is_present_but_not_ready() {
     assert!(patches.contains("4cda0ae"));
     assert!(patches.contains("800495f"));
     assert!(patches.contains("NOT_IMPLEMENTED"));
+
+    let mut missing = vec!["NOTICE".to_owned()];
+    for asset in [
+        "encrypted-spaces-backend-linux-amd64.tar.gz",
+        "encrypted-spaces-backend-linux-arm64.tar.gz",
+        "encrypted-spaces-backend-macos-amd64.tar.gz",
+        "encrypted-spaces-backend-macos-arm64.tar.gz",
+        "encrypted-spaces-bridge-linux-amd64.tar.gz",
+        "encrypted-spaces-bridge-linux-arm64.tar.gz",
+        "encrypted-spaces-bridge-macos-amd64.tar.gz",
+        "encrypted-spaces-bridge-macos-arm64.tar.gz",
+    ] {
+        let path = root.join("dist").join(asset);
+        if !path.is_file() || std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) == 0 {
+            missing.push(format!("dist/{asset}"));
+        }
+    }
+    assert!(
+        missing.len() == 0,
+        "release contract RED: missing NOTICE/dist release assets: {}",
+        missing.join(", ")
+    );
 }

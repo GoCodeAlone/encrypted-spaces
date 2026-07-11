@@ -21,7 +21,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout pinned upstream descendant
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           fetch-depth: 0
 
@@ -53,8 +53,8 @@ jobs:
           echo "RUSTC=$RUSTC" >> "$GITHUB_ENV"
           echo "RUSTDOC=$RUSTDOC" >> "$GITHUB_ENV"
           echo "$(dirname "$RUSTC")" >> "$GITHUB_PATH"
-          "$RUSTC" --version
-          "$RUSTDOC" --version
+          "$RUSTC" --version | grep -Fq " $RUST_VERSION "
+          "$RUSTDOC" --version | grep -Fq " $RUST_VERSION "
 
       - name: Validate build and publication markers
         shell: bash
@@ -69,38 +69,67 @@ jobs:
 
   assets:
     needs: contract
-    if: ${{ false }}
     strategy:
       matrix:
         include:
           - component: backend
             os: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
+            target: linux-amd64
+            archive: encrypted-spaces-backend-linux-amd64.tar.gz
           - component: backend
             os: ubuntu-24.04
-            target: aarch64-unknown-linux-gnu
+            target: linux-arm64
+            archive: encrypted-spaces-backend-linux-arm64.tar.gz
           - component: backend
             os: macos-13
-            target: x86_64-apple-darwin
+            target: macos-amd64
+            archive: encrypted-spaces-backend-macos-amd64.tar.gz
           - component: backend
             os: macos-14
-            target: aarch64-apple-darwin
+            target: macos-arm64
+            archive: encrypted-spaces-backend-macos-arm64.tar.gz
           - component: bridge
             os: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
+            target: linux-amd64
+            archive: encrypted-spaces-bridge-linux-amd64.tar.gz
           - component: bridge
             os: ubuntu-24.04
-            target: aarch64-unknown-linux-gnu
+            target: linux-arm64
+            archive: encrypted-spaces-bridge-linux-arm64.tar.gz
           - component: bridge
             os: macos-13
-            target: x86_64-apple-darwin
+            target: macos-amd64
+            archive: encrypted-spaces-bridge-macos-amd64.tar.gz
           - component: bridge
             os: macos-14
-            target: aarch64-apple-darwin
+            target: macos-arm64
+            archive: encrypted-spaces-bridge-macos-arm64.tar.gz
     runs-on: ${{ matrix.os }}
     steps:
-      - name: Future asset contract
+      - name: Checkout release contents
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Verify dist release contract
+        shell: bash
+        env:
+          DIST_CONTRACT: dist
+          ARCHIVE: ${{ matrix.archive }}
         run: |
-          echo "${{ matrix.component }}-${{ matrix.target }}"
-          echo "checksums: sha256sum / shasum -a 256"
-          echo "provenance: $PROVENANCE"
+          set -euo pipefail
+          archive="$DIST_CONTRACT/$ARCHIVE"
+          checksum="$DIST_CONTRACT/checksums/$ARCHIVE.sha256"
+          provenance="$DIST_CONTRACT/provenance/$ARCHIVE.intoto.jsonl"
+          license="$DIST_CONTRACT/LICENSE"
+          notice="$DIST_CONTRACT/NOTICE"
+          manifest="$DIST_CONTRACT/release-manifest.json"
+          test -s "$manifest"
+          test -s "$archive"
+          test -s "$checksum"
+          test -s "$provenance"
+          test -s "$license"
+          test -s "$notice"
+          grep -Fq "$ARCHIVE" "$manifest"
+          grep -Fq "$ARCHIVE" "$checksum"
+          grep -Fq "$ARCHIVE" "$provenance"
+          grep -Fq 'Apache License' "$license"
+          grep -Fq 'Apache' "$notice"

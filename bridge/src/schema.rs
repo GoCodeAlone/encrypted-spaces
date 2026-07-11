@@ -37,15 +37,15 @@ pub enum Operation {
     Hello,
     Version,
     Cancel,
-    #[serde(alias = "space.create")]
+    #[serde(rename = "space.create")]
     Create,
-    #[serde(alias = "space.join")]
+    #[serde(rename = "space.join")]
     Join,
-    #[serde(alias = "space.snapshot")]
+    #[serde(rename = "space.snapshot")]
     Snapshot,
-    #[serde(alias = "space.restore")]
+    #[serde(rename = "space.restore")]
     Restore,
-    #[serde(alias = "space.sync")]
+    #[serde(rename = "space.sync")]
     Sync,
     #[serde(rename = "table.insert")]
     TableInsert,
@@ -83,11 +83,11 @@ impl Operation {
             Self::Hello => "hello",
             Self::Version => "version",
             Self::Cancel => "cancel",
-            Self::Create => "create",
-            Self::Join => "join",
-            Self::Snapshot => "snapshot",
-            Self::Restore => "restore",
-            Self::Sync => "sync",
+            Self::Create => "space.create",
+            Self::Join => "space.join",
+            Self::Snapshot => "space.snapshot",
+            Self::Restore => "space.restore",
+            Self::Sync => "space.sync",
             Self::TableInsert => "table.insert",
             Self::TableSelect => "table.select",
             Self::ListCreate => "list.create",

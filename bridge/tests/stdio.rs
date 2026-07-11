@@ -61,6 +61,19 @@ fn protocol_version_is_red() {
 }
 
 #[test]
+fn protocol_bare_space_lifecycle_names_are_rejected() {
+    for operation in ["create", "join", "snapshot", "restore", "sync"] {
+        let actor = actor(operation);
+        let response = &invoke(&request(operation, &actor, json!({})))[0];
+        assert_eq!(
+            response["ok"], false,
+            "bare operation accepted: {operation}"
+        );
+        assert_eq!(response["error"]["code"], "INVALID_JSON");
+    }
+}
+
+#[test]
 fn protocol_malformed_frame_has_stable_error() {
     let response = &invoke("not-json\n")[0];
     assert_eq!(response["ok"], false);
