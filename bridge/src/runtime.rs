@@ -109,12 +109,46 @@ struct ListReadPayload {
     list_ref: String,
 }
 
+#[derive(Clone, Copy, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RefKind {
+    List,
+    Text,
+}
+
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct ListRef {
+struct ScopedRef {
+    kind: RefKind,
     table: String,
     row_id: i64,
     column: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TextCreatePayload {
+    space_id: String,
+    table: String,
+    row_id: i64,
+    column: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TextEditPayload {
+    space_id: String,
+    text_ref: String,
+    position: usize,
+    delete_count: usize,
+    insert: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TextReadPayload {
+    space_id: String,
+    text_ref: String,
 }
 
 #[derive(Serialize)]
@@ -179,6 +213,29 @@ struct ListReadResult {
     space_id: String,
     list_ref: String,
     items: Vec<ListItemResult>,
+}
+
+#[derive(Serialize)]
+struct TextCreateResult {
+    space_id: String,
+    table: String,
+    row_id: i64,
+    column: String,
+    text_ref: String,
+}
+
+#[derive(Serialize)]
+struct TextEditResult {
+    space_id: String,
+    text_ref: String,
+    edited: bool,
+}
+
+#[derive(Serialize)]
+struct TextReadResult {
+    space_id: String,
+    text_ref: String,
+    text: String,
 }
 
 impl Runtime {
@@ -250,6 +307,9 @@ impl Runtime {
             Operation::ListCreate => self.list_create(request.request_id, request.payload),
             Operation::ListAppend => self.list_append(request.request_id, request.payload),
             Operation::ListRead => self.list_read(request.request_id, request.payload),
+            Operation::TextCreate => self.text_create(request.request_id, request.payload),
+            Operation::TextEdit => self.text_edit(request.request_id, request.payload),
+            Operation::TextRead => self.text_read(request.request_id, request.payload),
             operation => {
                 let _operation_name = operation.name();
                 let _ = request.payload;
@@ -436,7 +496,8 @@ impl Runtime {
         if self.executor.block_on(list.get_all()).is_err() {
             return sdk_error(request_id);
         }
-        let list_ref = match encode_opaque_ref(&ListRef {
+        let list_ref = match encode_opaque_ref(&ScopedRef {
+            kind: RefKind::List,
             table: payload.table.clone(),
             row_id: payload.row_id,
             column: payload.column.clone(),
@@ -461,9 +522,9 @@ impl Runtime {
             Ok(payload) => payload,
             Err(response) => return response,
         };
-        let list_ref = match decode_opaque_ref::<ListRef>(&payload.list_ref) {
-            Ok(list_ref) => list_ref,
-            Err(()) => return invalid_request(request_id),
+        let list_ref = match decode_opaque_ref::<ScopedRef>(&payload.list_ref) {
+            Ok(list_ref) if list_ref.kind == RefKind::List => list_ref,
+            Ok(_) | Err(()) => return invalid_request(request_id),
         };
         let Some(space) = self.space.as_ref() else {
             return invalid_state(request_id);
@@ -491,9 +552,9 @@ impl Runtime {
             Ok(payload) => payload,
             Err(response) => return response,
         };
-        let list_ref = match decode_opaque_ref::<ListRef>(&payload.list_ref) {
-            Ok(list_ref) => list_ref,
-            Err(()) => return invalid_request(request_id),
+        let list_ref = match decode_opaque_ref::<ScopedRef>(&payload.list_ref) {
+            Ok(list_ref) if list_ref.kind == RefKind::List => list_ref,
+            Ok(_) | Err(()) => return invalid_request(request_id),
         };
         let Some(space) = self.space.as_ref() else {
             return invalid_state(request_id);
@@ -517,6 +578,124 @@ impl Runtime {
                             value: entry.value,
                         })
                         .collect(),
+                },
+            ),
+            Err(_) => sdk_error(request_id),
+        }
+    }
+
+    fn text_create(&mut self, request_id: String, payload: Value) -> Response {
+        let payload = match parse_payload::<TextCreatePayload>(&request_id, payload) {
+            Ok(payload)
+                if !payload.table.is_empty()
+                    && payload.row_id > 0
+                    && !payload.column.is_empty() =>
+            {
+                payload
+            }
+            Ok(_) => return invalid_request(request_id),
+            Err(response) => return response,
+        };
+        let Some(space) = self.space.as_ref() else {
+            return invalid_state(request_id);
+        };
+        let space_id = space.id().to_string();
+        if payload.space_id != space_id {
+            return invalid_state(request_id);
+        }
+        let text = space.textarea(&payload.table, payload.row_id, &payload.column);
+        if self.executor.block_on(text.sync()).is_err() {
+            return sdk_error(request_id);
+        }
+        let text_ref = match encode_opaque_ref(&ScopedRef {
+            kind: RefKind::Text,
+            table: payload.table.clone(),
+            row_id: payload.row_id,
+            column: payload.column.clone(),
+        }) {
+            Ok(text_ref) => text_ref,
+            Err(()) => return internal_error(request_id),
+        };
+        Response::success(
+            request_id,
+            TextCreateResult {
+                space_id,
+                table: payload.table,
+                row_id: payload.row_id,
+                column: payload.column,
+                text_ref,
+            },
+        )
+    }
+
+    fn text_edit(&mut self, request_id: String, payload: Value) -> Response {
+        let payload = match parse_payload::<TextEditPayload>(&request_id, payload) {
+            Ok(payload) => payload,
+            Err(response) => return response,
+        };
+        let text_ref = match decode_opaque_ref::<ScopedRef>(&payload.text_ref) {
+            Ok(text_ref) if text_ref.kind == RefKind::Text => text_ref,
+            Ok(_) | Err(()) => return invalid_request(request_id),
+        };
+        let Some(delete_end) = payload.position.checked_add(payload.delete_count) else {
+            return invalid_request(request_id);
+        };
+        let Some(space) = self.space.as_ref() else {
+            return invalid_state(request_id);
+        };
+        let space_id = space.id().to_string();
+        if payload.space_id != space_id {
+            return invalid_state(request_id);
+        }
+        let text = space.textarea(&text_ref.table, text_ref.row_id, &text_ref.column);
+        let result = self.executor.block_on(async {
+            text.sync().await?;
+            if payload.delete_count > 0 {
+                text.delete_range(payload.position, delete_end).await?;
+            }
+            if !payload.insert.is_empty() {
+                text.insert_string(payload.position, &payload.insert)
+                    .await?;
+            }
+            encrypted_spaces_sdk::SdkResult::Ok(())
+        });
+        match result {
+            Ok(()) => Response::success(
+                request_id,
+                TextEditResult {
+                    space_id,
+                    text_ref: payload.text_ref,
+                    edited: true,
+                },
+            ),
+            Err(_) => sdk_error(request_id),
+        }
+    }
+
+    fn text_read(&mut self, request_id: String, payload: Value) -> Response {
+        let payload = match parse_payload::<TextReadPayload>(&request_id, payload) {
+            Ok(payload) => payload,
+            Err(response) => return response,
+        };
+        let text_ref = match decode_opaque_ref::<ScopedRef>(&payload.text_ref) {
+            Ok(text_ref) if text_ref.kind == RefKind::Text => text_ref,
+            Ok(_) | Err(()) => return invalid_request(request_id),
+        };
+        let Some(space) = self.space.as_ref() else {
+            return invalid_state(request_id);
+        };
+        let space_id = space.id().to_string();
+        if payload.space_id != space_id {
+            return invalid_state(request_id);
+        }
+        let text = space.textarea(&text_ref.table, text_ref.row_id, &text_ref.column);
+        match self.executor.block_on(text.snapshot()) {
+            Ok(text) => Response::success(
+                request_id,
+                TextReadResult {
+                    space_id,
+                    text_ref: payload.text_ref,
+                    text,
                 },
             ),
             Err(_) => sdk_error(request_id),

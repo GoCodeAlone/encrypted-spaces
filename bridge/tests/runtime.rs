@@ -1123,7 +1123,7 @@ fn runtime_list_create_append_read_round_trip() {
 }
 
 #[test]
-fn runtime_text_create_edit_read_are_red() {
+fn runtime_text_create_edit_read_round_trip() {
     let actor = "actor-text-parametric";
     let edited = "edited text parametric";
     let mut scenario = Scenario::start("text", &[actor]);
@@ -1163,6 +1163,11 @@ fn runtime_text_create_edit_read_are_red() {
         "text.read",
         json!({"space_id": space_id, "text_ref": text_ref}),
     );
+    let wrong_kind = scenario.request(
+        actor,
+        "list.read",
+        json!({"space_id": space_id, "list_ref": text_ref}),
+    );
 
     scenario.verify::<SpaceCreateResult, _>(create_space, |result| {
         valid_created_space(result)
@@ -1192,6 +1197,11 @@ fn runtime_text_create_edit_read_are_red() {
         (result.space_id == space_id && result.text_ref == text_ref && result.text == edited)
             .then_some(())
             .ok_or_else(|| "text.read did not return the edited textarea".to_owned())
+    });
+    scenario.verify_error::<BridgeError, _>(wrong_kind, |error| {
+        (error.code == "INVALID_REQUEST")
+            .then_some(())
+            .ok_or_else(|| "list.read accepted a text capability".to_owned())
     });
     scenario.finish();
 }
