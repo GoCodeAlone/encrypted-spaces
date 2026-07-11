@@ -103,6 +103,42 @@ synchronization with the backend behind the scenes.
 See [`sdk/README.md`](sdk/README.md) for an overview, code examples, and
 quickstart instructions.
 
+## Runtime bridge
+
+The `encrypted-spaces-bridge` binary exposes the Rust SDK as bounded,
+versioned JSONL RPC over standard input and output. It is intended for
+non-Rust clients that need the prototype's actual encryption, verification,
+storage, synchronization, and membership behavior without reimplementing
+those algorithms.
+
+Each process owns one actor identity, one schema trust bundle, one backend
+endpoint, and at most one active Space. Configure them before launch:
+
+```sh
+export ENCRYPTED_SPACES_ACTOR_ID=local-client
+export ENCRYPTED_SPACES_SCHEMA_PATH=/path/to/app-schema.kdl
+export ENCRYPTED_SPACES_BACKEND_URL=ws://127.0.0.1:8080/ws
+encrypted-spaces-bridge
+```
+
+Requests cannot override the actor, schema, data commitment, or fast-forward
+guest image ID. `hello` reports those process-derived trust values. The
+bridge supports Space create/join/snapshot/restore/sync, table insert/select,
+scoped list and collaborative text operations, encrypted file put/get,
+member invite/join/remove, cancellation, close, and shutdown. Request and
+response payloads use protocol version `1`; frames larger than 64 KiB are
+rejected.
+
+Invites and snapshots contain private client custody material and must be
+stored as secrets. The backend remains untrusted and stores ciphertext and
+proof material, but loss of a client snapshot can prevent that client from
+recovering its Space state. This bridge does not add authentication to the
+prototype server.
+
+Release archives contain native backend and bridge binaries for Linux and
+macOS on amd64 and arm64, together with checksums, provenance, and Apache
+attribution. Both binaries report their release with `--version`.
+
 ## Prerequisites
 
 The Rust toolchain is pinned by [`rust-toolchain.toml`](rust-toolchain.toml)

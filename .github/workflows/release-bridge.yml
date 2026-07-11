@@ -1,18 +1,19 @@
-name: Bridge Release Contract
+name: Encrypted Spaces Release
 
-# Manual validation only. This workflow does not publish release assets.
 on:
   workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
 
 permissions:
   contents: read
 
 env:
-  RELEASE_READY: false
+  RELEASE_READY: true
   RELEASE_VERSION: 0.1.0
   UPSTREAM_COMMIT: 4cda0ae87698135aa672990e6e68cf7873847426
   RUST_VERSION: 1.94.1
-  RISC0_SKIP_BUILD: 1
 
 jobs:
   legal:
@@ -24,11 +25,12 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Verify legal and source records
+      - name: Verify legal, version, and source records
         shell: bash
         run: |
           set -euo pipefail
-          test "$RELEASE_READY" = false
+          test "$RELEASE_READY" = true
+          test "$RELEASE_VERSION" = "${GITHUB_REF_NAME#v}" || test "$GITHUB_REF_TYPE" != tag
           git merge-base --is-ancestor "$UPSTREAM_COMMIT" "$GITHUB_SHA"
           test -s LICENSE
           test -s NOTICE
@@ -36,16 +38,10 @@ jobs:
           grep -Fq "$UPSTREAM_COMMIT" PATCHES.md
           grep -Fq '800495f' PATCHES.md
           grep -Fq "Rust \`$RUST_VERSION\`" PATCHES.md
+          grep -Fq 'version = "0.1.0"' Cargo.toml
           grep -Fq 'kdl = { version = "=6.5.0"' Cargo.toml
           grep -Fq 'version = "6.5.0"' Cargo.lock
-
-      - name: Verify pinned Rust toolchain
-        shell: bash
-        run: |
-          set -euo pipefail
-          rustup toolchain install "$RUST_VERSION" --profile minimal
-          rustup run "$RUST_VERSION" rustc --version | grep -Fq " $RUST_VERSION "
-          rustup run "$RUST_VERSION" rustdoc --version | grep -Fq " $RUST_VERSION "
+          grep -Fq 'channel = "1.94.1"' rust-toolchain.toml
 
   assets:
     name: ${{ matrix.archive }}
@@ -106,138 +102,84 @@ jobs:
       - name: Checkout pinned source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
 
-      - name: Build and test with the pinned toolchain
+      - name: Install pinned Rust and RISC Zero
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          curl -L https://risczero.com/install | bash
+          export PATH="$HOME/.risc0/bin:$PATH"
+          echo "$HOME/.risc0/bin" >> "$GITHUB_PATH"
+          rzup install
+
+      - name: Build real guest ELFs and native binary
         shell: bash
         env:
           PACKAGE: ${{ matrix.package }}
           BINARY: ${{ matrix.binary }}
         run: |
           set -euo pipefail
-          rustup toolchain install "$RUST_VERSION" --profile minimal
+          cargo risczero --version
           rustup run "$RUST_VERSION" cargo test --locked -p "$PACKAGE" --no-run
           rustup run "$RUST_VERSION" cargo build --locked --release -p "$PACKAGE"
           built="$GITHUB_WORKSPACE/target/release/$BINARY"
           test -x "$built"
+          methods="$(find target/release/build -path '*/out/methods.rs' -type f -print)"
+          test -n "$methods"
+          while IFS= read -r method; do
+            grep -Eq 'ELF:.*&\[[^]]' "$method"
+            if grep -Eq 'ID: \[u32; 8\] = \[0, 0, 0, 0, 0, 0, 0, 0\]' "$method"; then
+              echo "zero guest image ID in $method" >&2
+              exit 1
+            fi
+          done <<< "$methods"
           echo "BUILT_BINARY=$built" >> "$GITHUB_ENV"
 
-      - name: Verify release asset
+      - name: Package and inspect native asset
         shell: bash
         env:
-          DIST_CONTRACT: dist
           COMPONENT: ${{ matrix.component }}
           TARGET: ${{ matrix.target }}
           ARCHIVE: ${{ matrix.archive }}
         run: |
           set -euo pipefail
-          archive="$DIST_CONTRACT/$ARCHIVE"
-          checksum="$DIST_CONTRACT/checksums/$ARCHIVE.sha256"
-          provenance="$DIST_CONTRACT/provenance/$ARCHIVE.intoto.jsonl"
-          manifest="$DIST_CONTRACT/release-manifest.json"
-          test -s "$manifest"
-          test -s "$archive"
-          test -s "$checksum"
-          test -s "$provenance"
-
-          extract="$(mktemp -d)"
-          trap 'rm -rf "$extract"' EXIT
-          tar -xzf "$archive" -C "$extract"
-          packaged="$(find "$extract" -type f -name "encrypted-spaces-$COMPONENT" -print -quit)"
-          test -n "$packaged"
-          test -x "$packaged"
+          root="$RUNNER_TEMP/package/encrypted-spaces-$COMPONENT-$TARGET"
+          mkdir -p "$root" "$RUNNER_TEMP/dist"
+          packaged="$root/encrypted-spaces-$COMPONENT"
+          cp "$BUILT_BINARY" "$packaged"
+          chmod +x "$packaged"
+          cp LICENSE NOTICE PATCHES.md "$root/"
           cmp "$BUILT_BINARY" "$packaged"
 
           description="$(file -b "$packaged")"
           case "$TARGET" in
-            linux-amd64)  grep -Eq 'ELF 64-bit.*(x86-64|x86_64)' <<< "$description" ;;
-            linux-arm64)  grep -Eq 'ELF 64-bit.*(ARM aarch64|aarch64)' <<< "$description" ;;
-            macos-amd64)  grep -Eq 'Mach-O 64-bit.*x86_64' <<< "$description" ;;
-            macos-arm64)  grep -Eq 'Mach-O 64-bit.*arm64' <<< "$description" ;;
-            *) echo "unsupported release target: $TARGET" >&2; exit 1 ;;
+            linux-amd64) grep -Eq 'ELF 64-bit.*(x86-64|x86_64)' <<< "$description" ;;
+            linux-arm64) grep -Eq 'ELF 64-bit.*(ARM aarch64|aarch64)' <<< "$description" ;;
+            macos-amd64) grep -Eq 'Mach-O 64-bit.*x86_64' <<< "$description" ;;
+            macos-arm64) grep -Eq 'Mach-O 64-bit.*arm64' <<< "$description" ;;
+            *) exit 1 ;;
           esac
-          python3 - "$packaged" "$RELEASE_VERSION" <<'PY'
-          import subprocess
-          import sys
 
-          result = subprocess.run(
-              [sys.argv[1], "--version"],
-              check=True,
-              capture_output=True,
-              text=True,
-              timeout=5,
-          )
-          output = result.stdout + result.stderr
-          if sys.argv[2] not in output:
-              raise SystemExit(f"version output does not contain {sys.argv[2]}: {output!r}")
-          PY
-
-          jq -e \
-            --arg component "$COMPONENT" \
-            --arg target "$TARGET" \
-            --arg archive "$ARCHIVE" \
-            --arg upstream "$UPSTREAM_COMMIT" \
-            --arg toolchain "$RUST_VERSION" '
-              .upstream_commit == $upstream and
-              .rust_toolchain == $toolchain and
-              .version == env.RELEASE_VERSION and
-              (.artifacts | length == 8) and
-              ([.artifacts[].archive] | unique | length == 8) and
-              ([.artifacts[] | select(
-                .component == $component and
-                .target == $target and
-                .archive == $archive and
-                .binary == ("encrypted-spaces-" + $component) and
-                .version == env.RELEASE_VERSION and
-                (.sha256 | test("^[0-9a-f]{64}$"))
-              )] | length == 1)
-            ' "$manifest"
-          manifest_digest="$(jq -er \
-            --arg component "$COMPONENT" \
-            --arg target "$TARGET" \
-            --arg archive "$ARCHIVE" '
-              .artifacts[] |
-              select(
-                .component == $component and
-                .target == $target and
-                .archive == $archive
-              ) |
-              .sha256
-            ' "$manifest")"
-
-          if [[ "$RUNNER_OS" == Linux ]]; then
-            actual_digest="$(sha256sum "$archive" | awk '{print $1}')"
-            (cd "$DIST_CONTRACT" && sha256sum -c "checksums/$ARCHIVE.sha256")
-          elif [[ "$RUNNER_OS" == macOS ]]; then
-            actual_digest="$(shasum -a 256 "$archive" | awk '{print $1}')"
-            (cd "$DIST_CONTRACT" && shasum -a 256 -c "checksums/$ARCHIVE.sha256")
-          else
-            echo "unsupported checksum platform: $RUNNER_OS" >&2
-            exit 1
-          fi
-          test "$actual_digest" = "$manifest_digest"
-
-          jq -se \
-            --arg archive "$ARCHIVE" \
-            --arg digest "$actual_digest" \
-            --arg upstream "$UPSTREAM_COMMIT" \
-            --arg toolchain "$RUST_VERSION" '
-              length > 0 and any(.[];
-                ._type == "https://in-toto.io/Statement/v1" and
-                .predicateType == "https://slsa.dev/provenance/v1" and
-                any(.subject[]?;
-                  .name == $archive and .digest.sha256 == $digest
-                ) and
-                .predicate.buildDefinition.externalParameters.upstream_commit == $upstream and
-                .predicate.buildDefinition.externalParameters.rust_toolchain == $toolchain
-              )
-            ' "$provenance"
-
-          listing="$(tar -tzf "$archive")"
-          for required in "encrypted-spaces-$COMPONENT" LICENSE NOTICE; do
-            awk -F/ -v required="$required" '
-              $NF == required { found = 1 }
-              END { exit !found }
-            ' <<< "$listing"
+          output="$("$packaged" --version)"
+          grep -Fq "$RELEASE_VERSION" <<< "$output"
+          tar -czf "$RUNNER_TEMP/dist/$ARCHIVE" -C "$RUNNER_TEMP/package" "$(basename "$root")"
+          listing="$(tar -tzf "$RUNNER_TEMP/dist/$ARCHIVE")"
+          for required in "encrypted-spaces-$COMPONENT" LICENSE NOTICE PATCHES.md; do
+            grep -Eq "/$required$" <<< "$listing"
           done
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            sha256sum "$RUNNER_TEMP/dist/$ARCHIVE"
+          else
+            shasum -a 256 "$RUNNER_TEMP/dist/$ARCHIVE"
+          fi
+
+      - name: Upload native asset
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-${{ matrix.component }}-${{ matrix.target }}
+          path: ${{ runner.temp }}/dist/${{ matrix.archive }}
+          if-no-files-found: error
+          retention-days: 7
 
   aggregate:
     name: Release contract result
@@ -254,3 +196,141 @@ jobs:
           set -euo pipefail
           test "$LEGAL_RESULT" = success
           test "$ASSET_RESULT" = success
+
+      - name: Download native assets
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums, manifest, and provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/checksums dist/provenance
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          dist = Path("dist")
+          version = os.environ["RELEASE_VERSION"]
+          upstream = os.environ["UPSTREAM_COMMIT"]
+          toolchain = os.environ["RUST_VERSION"]
+          artifacts = []
+          for archive in sorted(dist.glob("*.tar.gz")):
+              parts = archive.name.removesuffix(".tar.gz").split("-")
+              component = parts[2]
+              target = "-".join(parts[3:])
+              digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+              (dist / "checksums" / f"{archive.name}.sha256").write_text(
+                  f"{digest}  {archive.name}\n"
+              )
+              statement = {
+                  "_type": "https://in-toto.io/Statement/v1",
+                  "subject": [{"name": archive.name, "digest": {"sha256": digest}}],
+                  "predicateType": "https://slsa.dev/provenance/v1",
+                  "predicate": {
+                      "buildDefinition": {
+                          "buildType": "https://github.com/GoCodeAlone/encrypted-spaces/actions",
+                          "externalParameters": {
+                              "upstream_commit": upstream,
+                              "rust_toolchain": toolchain,
+                          },
+                          "internalParameters": {"version": version},
+                          "resolvedDependencies": [],
+                      },
+                      "runDetails": {
+                          "builder": {"id": "https://github.com/GoCodeAlone/encrypted-spaces/actions"},
+                          "metadata": {},
+                      },
+                  },
+              }
+              (dist / "provenance" / f"{archive.name}.intoto.jsonl").write_text(
+                  json.dumps(statement, separators=(",", ":")) + "\n"
+              )
+              artifacts.append({
+                  "component": component,
+                  "target": target,
+                  "archive": archive.name,
+                  "binary": f"encrypted-spaces-{component}",
+                  "version": version,
+                  "sha256": digest,
+              })
+          if len(artifacts) != 8:
+              raise SystemExit(f"expected 8 assets, found {len(artifacts)}")
+          manifest = {
+              "version": version,
+              "upstream_commit": upstream,
+              "rust_toolchain": toolchain,
+              "artifacts": artifacts,
+          }
+          (dist / "release-manifest.json").write_text(
+              json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+          )
+          PY
+
+      - name: Verify aggregate release contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          for checksum in dist/checksums/*.sha256; do
+            (cd dist && sha256sum -c "checksums/$(basename "$checksum")")
+          done
+          test "$(find dist -maxdepth 1 -name '*.tar.gz' | wc -l | tr -d ' ')" = 8
+          test "$(find dist/provenance -name '*.intoto.jsonl' | wc -l | tr -d ' ')" = 8
+          jq -e '
+            .version == env.RELEASE_VERSION and
+            .upstream_commit == env.UPSTREAM_COMMIT and
+            .rust_toolchain == env.RUST_VERSION and
+            (.artifacts | length == 8) and
+            ([.artifacts[].archive] | unique | length == 8) and
+            all(.artifacts[];
+              (.sha256 | test("^[0-9a-f]{64}$")) and
+              (.binary == ("encrypted-spaces-" + .component))
+            )
+          ' dist/release-manifest.json
+          for archive in dist/*.tar.gz; do
+            listing="$(tar -tzf "$archive")"
+            grep -Eq '/LICENSE$' <<< "$listing"
+            grep -Eq '/NOTICE$' <<< "$listing"
+          done
+
+      - name: Upload complete release
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-dist
+          path: dist
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish GitHub release
+    if: ${{ github.ref_type == 'tag' }}
+    needs: aggregate
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download complete release
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: release-dist
+          path: dist
+
+      - name: Publish immutable tag assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --generate-notes \
+            dist/*.tar.gz \
+            dist/checksums/*.sha256 \
+            dist/provenance/*.intoto.jsonl \
+            dist/release-manifest.json

@@ -8,16 +8,14 @@ This ledger records the intentional delta from upstream commit
 - `800495f` pins `kdl` to `=6.5.0` and repairs the matching lock entries for
   Rust `1.94.1`.
 - Adds `encrypted-spaces-bridge`, a typed versioned JSONL stdio boundary with
-  bounded frames and secret-redacted protocol errors.
-- Adds boundary tests for the bridge lifecycle, data, membership, cancellation,
-  framing, process exit, and release contract surfaces.
-- Adds a public-repository release contract workflow. It does not publish and
-  `RELEASE_READY=false` is intentional.
-
-## Pending Release Work
-
-- All SDK/backend runtime behavior. Every declared operation currently returns
-  `NOT_IMPLEMENTED`.
-- Real Linux/macOS amd64/arm64 builds, checksums, and provenance attestations.
-- The Apache `NOTICE` attribution file. The release workflow keeps this as a
-  failing legal-release gate until supplied.
+  bounded frames, secret-redacted errors, process-owned trust configuration,
+  cancellable waits, and SDK-backed space, table, list, text, file, and member
+  operations.
+- Adds an owned schema-bytes SDK input for runtime-loaded KDL without leaking
+  configuration to obtain a static lifetime.
+- Adds launched backend/bridge conformance tests covering restart restoration,
+  multi-process membership, verified synchronization, revocation, and every
+  bridge data primitive.
+- Adds native Linux/macOS amd64/arm64 release automation with real RISC Zero
+  guest builds, checksums, in-toto provenance, Apache attribution, and tag-only
+  GitHub release publication.
