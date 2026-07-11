@@ -776,7 +776,7 @@ fn runtime_hello_health_metadata_is_process_bound() {
     let expected_guest_id = encrypted_spaces_ffproof::EXTEND_FF_ID.to_vec();
 
     for response in [&first_response, &second_response, &changed_response] {
-        assert_eq!(response["ok"], true, "hello trust metadata is still RED");
+        assert_eq!(response["ok"], true, "hello trust metadata failed");
     }
     let first: HelloResult =
         serde_json::from_value(first_response["result"].clone()).expect("first hello result");

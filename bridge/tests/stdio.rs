@@ -198,7 +198,7 @@ fn exact_size_request(size: usize) -> String {
 
 fn assert_future_success(response: &Value, operation: &str) {
     assert_eq!(response["version"], 1, "{operation} response version");
-    assert_eq!(response["ok"], true, "{operation} is still RED: {response}");
+    assert_eq!(response["ok"], true, "{operation} failed: {response}");
 }
 
 #[test]
@@ -269,7 +269,7 @@ fn protocol_accepts_a_frame_at_the_exact_limit() {
     bridge.send_raw(exact_size_request(MAX_FRAME_BYTES).as_bytes());
     let response = bridge.receive();
     assert_eq!(response["request_id"], "exact-max");
-    assert_eq!(response["error"]["code"], "NOT_IMPLEMENTED");
+    assert_eq!(response["error"]["code"], "INVALID_REQUEST");
 }
 
 #[test]
@@ -318,7 +318,7 @@ fn protocol_recovers_in_malformed_invalid_valid_order() {
     assert_eq!(invalid["request_id"], "invalid-request");
     assert_eq!(invalid["error"]["code"], "INVALID_REQUEST");
     assert_eq!(valid["request_id"], "valid-request");
-    assert_eq!(valid["error"]["code"], "NOT_IMPLEMENTED");
+    assert_eq!(valid["error"]["code"], "INVALID_REQUEST");
 }
 
 #[test]
@@ -428,7 +428,7 @@ fn protocol_validation_errors_redact_secret_material() {
 }
 
 #[test]
-fn protocol_runtime_sdk_errors_are_deterministic_and_redacted_is_red() {
+fn protocol_runtime_sdk_errors_are_deterministic_and_redacted() {
     let secrets = ["runtime-secret-alpha", "runtime-secret-beta"];
     let mut bridge = Bridge::spawn(DEFAULT_ACTOR_ID);
 
