@@ -48,6 +48,11 @@ pub enum ApplicationSchema {
     /// which pairs the bytes with a build-time-computed commitment and
     /// the FF-proof guest image ID.
     FromBytes(&'static [u8], DataCommitment, FfImageId),
+
+    /// Parse a schema bundle owned by a long-running runtime process.
+    /// This is equivalent to [`Self::FromBytes`] without requiring callers
+    /// to leak configuration loaded from disk at startup.
+    FromOwnedBytes(Vec<u8>, DataCommitment, FfImageId),
 }
 
 impl ApplicationSchema {
@@ -68,6 +73,9 @@ impl ApplicationSchema {
             }
             ApplicationSchema::FromBytes(bytes, commitment, image_id) => {
                 Self::app_schema_bundle_into_parts(bytes, commitment, image_id).await
+            }
+            ApplicationSchema::FromOwnedBytes(bytes, commitment, image_id) => {
+                Self::app_schema_bundle_into_parts(&bytes, commitment, image_id).await
             }
         }
     }

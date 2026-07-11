@@ -4,10 +4,11 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
-use std::sync::mpsc;
+use std::sync::{mpsc, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -16,6 +17,126 @@ const UPSTREAM_COMMIT: &str = "4cda0ae87698135aa672990e6e68cf7873847426";
 const RUST_TOOLCHAIN: &str = "1.94.1";
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
 const EXIT_TIMEOUT: Duration = Duration::from_secs(2);
+const BACKEND_START_TIMEOUT: Duration = Duration::from_secs(10);
+
+struct BackendProcess {
+    child: Child,
+    schema_path: PathBuf,
+    space_root: PathBuf,
+    url: String,
+}
+
+impl BackendProcess {
+    fn spawn(scenario: &str, schema: &str) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("reserve backend port");
+        let port = listener.local_addr().expect("backend address").port();
+        drop(listener);
+
+        let fixture_root = std::env::temp_dir().join(format!(
+            "encrypted-spaces-backend-{}-{scenario}",
+            std::process::id()
+        ));
+        let schema_path = fixture_root.join("schema.kdl");
+        let space_root = fixture_root.join("spaces");
+        fs::create_dir_all(&space_root).expect("create backend fixture root");
+        fs::write(&schema_path, schema).expect("write backend schema fixture");
+        let child = Command::new(backend_binary())
+            .args([
+                "--schema",
+                schema_path.to_str().expect("schema path is UTF-8"),
+                "--space-root",
+                space_root.to_str().expect("space root is UTF-8"),
+                "--bind-addr",
+                "127.0.0.1",
+                "--port",
+                &port.to_string(),
+            ])
+            .env("RISC0_DEV_MODE", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn backend fixture");
+        let mut backend = Self {
+            child,
+            schema_path,
+            space_root,
+            url: format!("ws://127.0.0.1:{port}/ws"),
+        };
+        backend.wait_for_health(port);
+        backend
+    }
+
+    fn wait_for_health(&mut self, port: u16) {
+        let deadline = Instant::now() + BACKEND_START_TIMEOUT;
+        loop {
+            if let Some(status) = self.child.try_wait().expect("poll backend process") {
+                panic!("backend exited before health check with {status}");
+            }
+            if backend_is_healthy(port) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "backend did not become healthy within {BACKEND_START_TIMEOUT:?}"
+            );
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
+}
+
+impl Drop for BackendProcess {
+    fn drop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+        if let Some(root) = self.schema_path.parent() {
+            let _ = fs::remove_dir_all(root);
+        } else {
+            let _ = fs::remove_dir_all(&self.space_root);
+        }
+    }
+}
+
+fn backend_binary() -> &'static Path {
+    static BINARY: OnceLock<PathBuf> = OnceLock::new();
+    BINARY
+        .get_or_init(|| {
+            let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .expect("workspace root");
+            let target = root.join("target/bridge-backend-fixture");
+            let status = Command::new("cargo")
+                .args(["build", "--locked", "-p", "encrypted-spaces-backend-server"])
+                .current_dir(root)
+                .env("CARGO_TARGET_DIR", &target)
+                .env("RISC0_SKIP_BUILD", "1")
+                .status()
+                .expect("build backend fixture");
+            assert!(
+                status.success(),
+                "backend fixture build failed with {status}"
+            );
+            target.join("debug/encrypted-spaces-backend-server")
+        })
+        .as_path()
+}
+
+fn backend_is_healthy(port: u16) -> bool {
+    let Ok(mut stream) = TcpStream::connect(("127.0.0.1", port)) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
+    if stream
+        .write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .is_err()
+    {
+        return false;
+    }
+    let mut response = String::new();
+    stream.read_to_string(&mut response).is_ok() && response.starts_with("HTTP/1.1 200")
+}
 
 enum StdoutEvent {
     Line(String),
@@ -39,6 +160,15 @@ impl BridgeProcess {
     }
 
     fn spawn_with_schema(scenario: &str, actor: &str, schema: &str) -> Self {
+        Self::spawn_with_backend(scenario, actor, schema, None)
+    }
+
+    fn spawn_with_backend(
+        scenario: &str,
+        actor: &str,
+        schema: &str,
+        backend_url: Option<&str>,
+    ) -> Self {
         let schema_path = std::env::temp_dir().join(format!(
             "encrypted-spaces-bridge-{}-{}-{}.kdl",
             std::process::id(),
@@ -46,13 +176,16 @@ impl BridgeProcess {
             actor
         ));
         fs::write(&schema_path, schema).expect("write bridge schema fixture");
-        let mut child = Command::new(env!("CARGO_BIN_EXE_encrypted-spaces-bridge"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_encrypted-spaces-bridge"));
+        command
             .env("ENCRYPTED_SPACES_ACTOR_ID", actor)
             .env("ENCRYPTED_SPACES_SCHEMA_PATH", &schema_path)
             .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .expect("spawn bridge");
+            .stdout(Stdio::piped());
+        if let Some(backend_url) = backend_url {
+            command.env("ENCRYPTED_SPACES_BACKEND_URL", backend_url);
+        }
+        let mut child = command.spawn().expect("spawn bridge");
         let stdin = child.stdin.take().expect("bridge stdin");
         let stdout = child.stdout.take().expect("bridge stdout");
         let (stdout_sender, stdout_receiver) = mpsc::channel();
@@ -208,6 +341,7 @@ struct Observation {
 
 struct Scenario {
     name: String,
+    backend: BackendProcess,
     bridges: BTreeMap<String, BridgeProcess>,
     observations: Vec<Observation>,
     failures: Vec<String>,
@@ -215,12 +349,19 @@ struct Scenario {
 
 impl Scenario {
     fn start(name: &str, actors: &[&str]) -> Self {
+        let backend = BackendProcess::spawn(name, SCHEMA_KDL);
         let bridges = actors
             .iter()
-            .map(|actor| ((*actor).to_owned(), BridgeProcess::spawn(name, actor)))
+            .map(|actor| {
+                (
+                    (*actor).to_owned(),
+                    BridgeProcess::spawn_with_backend(name, actor, SCHEMA_KDL, Some(&backend.url)),
+                )
+            })
             .collect();
         Self {
             name: name.to_owned(),
+            backend,
             bridges,
             observations: Vec::new(),
             failures: Vec::new(),
@@ -260,8 +401,15 @@ impl Scenario {
             .remove(actor)
             .unwrap_or_else(|| panic!("scenario actor {actor} has no bridge process"));
         previous.finish();
-        self.bridges
-            .insert(actor.to_owned(), BridgeProcess::spawn(&self.name, actor));
+        self.bridges.insert(
+            actor.to_owned(),
+            BridgeProcess::spawn_with_backend(
+                &self.name,
+                actor,
+                SCHEMA_KDL,
+                Some(&self.backend.url),
+            ),
+        );
     }
 
     fn returned_string(&self, index: usize, field: &str, fallback: &str) -> String {
@@ -607,7 +755,7 @@ fn runtime_request_trust_override_is_rejected() {
 }
 
 #[test]
-fn runtime_process_trust_metadata_is_derived_and_stable_is_red() {
+fn runtime_hello_health_metadata_is_process_bound() {
     let modified_schema = format!(
         "{SCHEMA_KDL}\ntable \"schema_change_probe\" {{\n    column \"id\" type=\"int\" plaintext=#true\n}}\n"
     );
@@ -651,6 +799,37 @@ fn runtime_process_trust_metadata_is_derived_and_stable_is_red() {
     assert_eq!(first.ff_guest_image_id, expected_guest_id);
     assert_eq!(second.ff_guest_image_id, first.ff_guest_image_id);
     assert_eq!(changed.ff_guest_image_id, first.ff_guest_image_id);
+}
+
+#[test]
+fn runtime_create_restore_uses_backend_and_survives_process_restart() {
+    let actor = "actor-create-restore-parametric";
+    let mut scenario = Scenario::start("create-restore", &[actor]);
+
+    let create = scenario.request(actor, "space.create", json!({}));
+    let space_id = scenario.returned_string(create, "space_id", "missing-create-space");
+    let snapshot = scenario.request(actor, "space.snapshot", json!({"space_id": space_id}));
+    let snapshot_value =
+        scenario.returned_value(snapshot, "snapshot", json!({"missing": "snapshot"}));
+    scenario.restart(actor);
+    let restore = scenario.request(actor, "space.restore", json!({"snapshot": snapshot_value}));
+
+    scenario.verify::<SpaceCreateResult, _>(create, |result| {
+        valid_created_space(result)
+            .then_some(())
+            .ok_or_else(|| "space.create returned an invalid SpaceId".to_owned())
+    });
+    scenario.verify::<SnapshotResult, _>(snapshot, |result| {
+        (result.space_id == space_id && is_opaque_ref(&result.snapshot))
+            .then_some(())
+            .ok_or_else(|| "space.snapshot returned the wrong space or no snapshot".to_owned())
+    });
+    scenario.verify::<RestoreResult, _>(restore, |result| {
+        (result.space_id == space_id && result.restored)
+            .then_some(())
+            .ok_or_else(|| "space.restore did not restore after process restart".to_owned())
+    });
+    scenario.finish();
 }
 
 #[test]

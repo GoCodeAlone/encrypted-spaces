@@ -202,7 +202,7 @@ fn assert_future_success(response: &Value, operation: &str) {
 }
 
 #[test]
-fn protocol_hello_reports_process_configured_actor_is_red() {
+fn protocol_hello_reports_process_configured_actor() {
     for actor_id in ["configured-actor-one", "configured-actor-two"] {
         let mut bridge = Bridge::spawn(actor_id);
         bridge.send_request("hello-request", "hello", json!({}));
@@ -213,7 +213,7 @@ fn protocol_hello_reports_process_configured_actor_is_red() {
 }
 
 #[test]
-fn protocol_version_is_red() {
+fn protocol_version_reports_bridge_contract() {
     let mut bridge = Bridge::spawn(DEFAULT_ACTOR_ID);
     bridge.send_request("version-request", "version", json!({}));
     assert_future_success(&bridge.receive(), "version");
