@@ -1,6 +1,7 @@
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
@@ -22,13 +23,17 @@ struct BridgeProcess {
 
 impl BridgeProcess {
     fn spawn(scenario: &str, actor: &str) -> Self {
+        Self::spawn_with_schema(scenario, actor, SCHEMA_KDL)
+    }
+
+    fn spawn_with_schema(scenario: &str, actor: &str, schema: &str) -> Self {
         let schema_path = std::env::temp_dir().join(format!(
             "encrypted-spaces-bridge-{}-{}-{}.kdl",
             std::process::id(),
             scenario,
             actor
         ));
-        fs::write(&schema_path, SCHEMA_KDL).expect("write bridge schema fixture");
+        fs::write(&schema_path, schema).expect("write bridge schema fixture");
         let mut child = Command::new(env!("CARGO_BIN_EXE_encrypted-spaces-bridge"))
             .env("ENCRYPTED_SPACES_ACTOR_ID", actor)
             .env("ENCRYPTED_SPACES_SCHEMA_PATH", &schema_path)
@@ -119,6 +124,7 @@ struct Observation {
 }
 
 struct Scenario {
+    name: String,
     bridges: BTreeMap<String, BridgeProcess>,
     observations: Vec<Observation>,
     failures: Vec<String>,
@@ -131,6 +137,7 @@ impl Scenario {
             .map(|actor| ((*actor).to_owned(), BridgeProcess::spawn(name, actor)))
             .collect();
         Self {
+            name: name.to_owned(),
             bridges,
             observations: Vec::new(),
             failures: Vec::new(),
@@ -162,6 +169,16 @@ impl Scenario {
         }
         self.observations.push(observation);
         self.observations.len() - 1
+    }
+
+    fn restart(&mut self, actor: &str) {
+        let previous = self
+            .bridges
+            .remove(actor)
+            .unwrap_or_else(|| panic!("scenario actor {actor} has no bridge process"));
+        previous.finish();
+        self.bridges
+            .insert(actor.to_owned(), BridgeProcess::spawn(&self.name, actor));
     }
 
     fn returned_string(&self, index: usize, field: &str, fallback: &str) -> String {
@@ -393,6 +410,10 @@ fn valid_digest(digest: &str) -> bool {
     digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+fn schema_digest(schema: &str) -> String {
+    format!("{:x}", Sha256::digest(schema.as_bytes()))
+}
+
 fn is_opaque_ref(value: &Value) -> bool {
     match value {
         Value::Null => false,
@@ -449,6 +470,48 @@ fn runtime_request_trust_override_is_rejected() {
 }
 
 #[test]
+fn runtime_process_trust_metadata_is_derived_and_stable_is_red() {
+    let modified_schema = format!(
+        "{SCHEMA_KDL}\ntable \"schema_change_probe\" {{\n    column \"id\" type=\"int\" plaintext=#true\n}}\n"
+    );
+    let mut first = BridgeProcess::spawn_with_schema("trust-first", "actor-first", SCHEMA_KDL);
+    let mut second = BridgeProcess::spawn_with_schema("trust-second", "actor-second", SCHEMA_KDL);
+    let mut changed =
+        BridgeProcess::spawn_with_schema("trust-changed", "actor-changed", &modified_schema);
+
+    let first_response = first.exchange("hello", json!({})).response;
+    let second_response = second.exchange("hello", json!({})).response;
+    let changed_response = changed.exchange("hello", json!({})).response;
+    first.finish();
+    second.finish();
+    changed.finish();
+
+    for response in [&first_response, &second_response, &changed_response] {
+        assert_eq!(response["ok"], true, "hello trust metadata is still RED");
+    }
+    let first: HelloResult =
+        serde_json::from_value(first_response["result"].clone()).expect("first hello result");
+    let second: HelloResult =
+        serde_json::from_value(second_response["result"].clone()).expect("second hello result");
+    let changed: HelloResult =
+        serde_json::from_value(changed_response["result"].clone()).expect("changed hello result");
+
+    assert_eq!(first.actor_id, "actor-first");
+    assert_eq!(second.actor_id, "actor-second");
+    assert_eq!(changed.actor_id, "actor-changed");
+    assert_eq!(first.schema_sha256, schema_digest(SCHEMA_KDL));
+    assert_eq!(second.schema_sha256, first.schema_sha256);
+    assert_eq!(changed.schema_sha256, schema_digest(&modified_schema));
+    assert_ne!(changed.schema_sha256, first.schema_sha256);
+    assert!(valid_digest(&first.data_commitment));
+    assert_eq!(second.data_commitment, first.data_commitment);
+    assert_ne!(changed.data_commitment, first.data_commitment);
+    assert_eq!(first.ff_guest_image_id.len(), 8);
+    assert_eq!(second.ff_guest_image_id, first.ff_guest_image_id);
+    assert_eq!(changed.ff_guest_image_id, first.ff_guest_image_id);
+}
+
+#[test]
 fn runtime_space_lifecycle_is_red() {
     let owner = "owner-lifecycle-parametric";
     let member = "member-lifecycle-parametric";
@@ -477,6 +540,7 @@ fn runtime_space_lifecycle_is_red() {
         "snapshot",
         json!({"missing": "lifecycle-snapshot"}),
     );
+    scenario.restart(owner);
     let restore = scenario.request(owner, "space.restore", json!({"snapshot": snapshot_value}));
     let restored_select = scenario.request(
         owner,
