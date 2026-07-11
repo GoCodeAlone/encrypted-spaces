@@ -1000,7 +1000,7 @@ fn runtime_space_lifecycle_is_red() {
 }
 
 #[test]
-fn runtime_table_insert_select_are_red() {
+fn runtime_table_insert_select_round_trip_verified_rows() {
     let actor = "actor-table-parametric";
     let label = "table-value-parametric";
     let rank = 41;

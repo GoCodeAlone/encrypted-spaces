@@ -67,6 +67,23 @@ struct SyncPayload {
     wait_for_change_ms: Option<u64>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TableInsertPayload {
+    space_id: String,
+    table: String,
+    row: Value,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TableSelectPayload {
+    space_id: String,
+    table: String,
+    #[serde(rename = "where")]
+    where_clause: serde_json::Map<String, Value>,
+}
+
 #[derive(Serialize)]
 struct CreateResult<'a> {
     space_id: String,
@@ -89,6 +106,16 @@ struct RestoreResult {
 struct SyncResult {
     space_id: String,
     synced: bool,
+}
+
+#[derive(Serialize)]
+struct TableInsertResult {
+    row_id: i64,
+}
+
+#[derive(Serialize)]
+struct TableSelectResult {
+    rows: Vec<Value>,
 }
 
 impl Runtime {
@@ -155,6 +182,8 @@ impl Runtime {
             Operation::Snapshot => self.snapshot(request.request_id, request.payload),
             Operation::Restore => self.restore(request.request_id, request.payload),
             Operation::Sync => self.sync(request.request_id, request.payload),
+            Operation::TableInsert => self.table_insert(request.request_id, request.payload),
+            Operation::TableSelect => self.table_select(request.request_id, request.payload),
             operation => {
                 let _operation_name = operation.name();
                 let _ = request.payload;
@@ -262,6 +291,62 @@ impl Runtime {
         }
     }
 
+    fn table_insert(&mut self, request_id: String, payload: Value) -> Response {
+        let payload = match parse_payload::<TableInsertPayload>(&request_id, payload) {
+            Ok(payload) if payload.row.is_object() => payload,
+            Ok(_) => return invalid_request(request_id),
+            Err(response) => return response,
+        };
+        let Some(space) = self.space.as_ref() else {
+            return invalid_state(request_id);
+        };
+        if payload.space_id != space.id().to_string() {
+            return invalid_state(request_id);
+        }
+        let table = space.table::<Value>(&payload.table);
+        match self.executor.block_on(table.insert(&payload.row).execute()) {
+            Ok(row_id) => Response::success(request_id, TableInsertResult { row_id }),
+            Err(_) => sdk_error(request_id),
+        }
+    }
+
+    fn table_select(&mut self, request_id: String, payload: Value) -> Response {
+        let payload = match parse_payload::<TableSelectPayload>(&request_id, payload) {
+            Ok(payload) => payload,
+            Err(response) => return response,
+        };
+        let Some(space) = self.space.as_ref() else {
+            return invalid_state(request_id);
+        };
+        if payload.space_id != space.id().to_string() || payload.where_clause.len() != 1 {
+            return invalid_request(request_id);
+        }
+        let (column, value) = payload
+            .where_clause
+            .into_iter()
+            .next()
+            .expect("one predicate");
+        let Some(schema) = space.get_table_schema(&payload.table) else {
+            return invalid_request(request_id);
+        };
+        if column != "id"
+            && !schema
+                .indexed_columns()
+                .iter()
+                .any(|indexed| indexed == &column)
+        {
+            return invalid_request(request_id);
+        }
+        let table = space.table::<Value>(&payload.table);
+        match self
+            .executor
+            .block_on(table.select().where_eq(&column, value).all())
+        {
+            Ok(rows) => Response::success(request_id, TableSelectResult { rows }),
+            Err(_) => sdk_error(request_id),
+        }
+    }
+
     fn application_schema(&self) -> ApplicationSchema {
         ApplicationSchema::FromOwnedBytes(
             self.process.schema.clone(),
@@ -286,6 +371,14 @@ fn invalid_state(request_id: String) -> Response {
         Some(request_id),
         "INVALID_STATE",
         "operation is not valid in the current bridge state",
+    )
+}
+
+fn invalid_request(request_id: String) -> Response {
+    Response::error(
+        Some(request_id),
+        "INVALID_REQUEST",
+        "invalid bridge request",
     )
 }
 
