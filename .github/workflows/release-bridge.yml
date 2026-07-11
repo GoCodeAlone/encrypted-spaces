@@ -62,7 +62,7 @@ jobs:
           - component: backend
             package: encrypted-spaces-backend-server
             binary: encrypted-spaces-backend-server
-            os: ubuntu-24.04
+            os: ubuntu-24.04-arm
             target: linux-arm64
             archive: encrypted-spaces-backend-linux-arm64.tar.gz
           - component: backend
@@ -86,7 +86,7 @@ jobs:
           - component: bridge
             package: encrypted-spaces-bridge
             binary: encrypted-spaces-bridge
-            os: ubuntu-24.04
+            os: ubuntu-24.04-arm
             target: linux-arm64
             archive: encrypted-spaces-bridge-linux-arm64.tar.gz
           - component: bridge
