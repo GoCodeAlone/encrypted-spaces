@@ -2247,9 +2247,12 @@ dependencies = [
 name = "encrypted-spaces-bridge"
 version = "0.0.1"
 dependencies = [
+ "encrypted-spaces-ffproof",
+ "encrypted-spaces-sdk",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tokio",
 ]
 
 [[package]]

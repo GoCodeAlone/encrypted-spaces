@@ -14,3 +14,8 @@ path = "src/main.rs"
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+
+[dev-dependencies]
+encrypted-spaces-ffproof = { workspace = true, features = ["prove"] }
+encrypted-spaces-sdk = { workspace = true, features = ["local-transport", "testing"] }
+tokio = { workspace = true, features = ["rt"] }

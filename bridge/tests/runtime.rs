@@ -414,6 +414,32 @@ fn schema_digest(schema: &str) -> String {
     format!("{:x}", Sha256::digest(schema.as_bytes()))
 }
 
+fn sdk_data_commitment(schema: &str, suffix: &str) -> String {
+    let schema_path = std::env::temp_dir().join(format!(
+        "encrypted-spaces-sdk-commitment-{}-{suffix}.kdl",
+        std::process::id()
+    ));
+    fs::write(&schema_path, schema).expect("write SDK commitment schema");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build SDK commitment runtime");
+    let commitment = runtime
+        .block_on(async {
+            let transport = encrypted_spaces_sdk::LocalTransport::from_schema_file(
+                schema_path.to_str().expect("schema path is UTF-8"),
+            )
+            .await?;
+            transport.get_root_hash().await
+        })
+        .expect("compute SDK data commitment");
+    fs::remove_file(schema_path).expect("remove SDK commitment schema");
+    commitment
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 fn is_opaque_ref(value: &Value) -> bool {
     match value {
         Value::Null => false,
@@ -486,6 +512,10 @@ fn runtime_process_trust_metadata_is_derived_and_stable_is_red() {
     second.finish();
     changed.finish();
 
+    let expected_commitment = sdk_data_commitment(SCHEMA_KDL, "stable");
+    let changed_commitment = sdk_data_commitment(&modified_schema, "changed");
+    let expected_guest_id = encrypted_spaces_ffproof::EXTEND_FF_ID.to_vec();
+
     for response in [&first_response, &second_response, &changed_response] {
         assert_eq!(response["ok"], true, "hello trust metadata is still RED");
     }
@@ -503,10 +533,11 @@ fn runtime_process_trust_metadata_is_derived_and_stable_is_red() {
     assert_eq!(second.schema_sha256, first.schema_sha256);
     assert_eq!(changed.schema_sha256, schema_digest(&modified_schema));
     assert_ne!(changed.schema_sha256, first.schema_sha256);
-    assert!(valid_digest(&first.data_commitment));
+    assert_eq!(first.data_commitment, expected_commitment);
     assert_eq!(second.data_commitment, first.data_commitment);
+    assert_eq!(changed.data_commitment, changed_commitment);
     assert_ne!(changed.data_commitment, first.data_commitment);
-    assert_eq!(first.ff_guest_image_id.len(), 8);
+    assert_eq!(first.ff_guest_image_id, expected_guest_id);
     assert_eq!(second.ff_guest_image_id, first.ff_guest_image_id);
     assert_eq!(changed.ff_guest_image_id, first.ff_guest_image_id);
 }
