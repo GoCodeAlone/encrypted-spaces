@@ -4,7 +4,9 @@ use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
     Engine,
 };
-use encrypted_spaces_sdk::{ApplicationSchema, File, LocalTransport, Space, WebSocketTransport};
+use encrypted_spaces_sdk::{
+    ApplicationSchema, File, LocalTransport, SdkErrorType, Space, SpaceInvite, WebSocketTransport,
+};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -168,6 +170,25 @@ struct FileGetPayload {
     digest: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JoinPayload {
+    invite: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MemberPayload {
+    space_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RemovePayload {
+    space_id: String,
+    member_id: i64,
+}
+
 #[derive(Serialize)]
 struct CreateResult<'a> {
     space_id: String,
@@ -268,6 +289,27 @@ struct FileGetResult {
     bytes_base64: String,
 }
 
+#[derive(Serialize)]
+struct InviteResult {
+    space_id: String,
+    member_id: i64,
+    invite: String,
+}
+
+#[derive(Serialize)]
+struct JoinResult {
+    space_id: String,
+    member_id: i64,
+    joined: bool,
+}
+
+#[derive(Serialize)]
+struct RemoveResult {
+    space_id: String,
+    member_id: i64,
+    removed: bool,
+}
+
 impl Runtime {
     pub fn from_env() -> io::Result<Self> {
         let actor_id = required_env(ACTOR_ID_ENV)?;
@@ -342,6 +384,11 @@ impl Runtime {
             Operation::TextRead => self.text_read(request.request_id, request.payload),
             Operation::FilePut => self.file_put(request.request_id, request.payload),
             Operation::FileGet => self.file_get(request.request_id, request.payload),
+            Operation::MemberInvite => self.member_invite(request.request_id, request.payload),
+            Operation::MemberJoin | Operation::Join => {
+                self.member_join(request.request_id, request.payload)
+            }
+            Operation::MemberRemove => self.member_remove(request.request_id, request.payload),
             operation => {
                 let _operation_name = operation.name();
                 let _ = request.payload;
@@ -391,7 +438,7 @@ impl Runtime {
         }
         match self.executor.block_on(space.snapshot()) {
             Ok(snapshot) => Response::success(request_id, SnapshotResult { space_id, snapshot }),
-            Err(_) => sdk_error(request_id),
+            Err(error) => sdk_operation_error(request_id, &error),
         }
     }
 
@@ -445,7 +492,7 @@ impl Runtime {
                     synced: true,
                 },
             ),
-            Err(_) => sdk_error(request_id),
+            Err(error) => sdk_operation_error(request_id, &error),
         }
     }
 
@@ -464,7 +511,7 @@ impl Runtime {
         let table = space.table::<Value>(&payload.table);
         match self.executor.block_on(table.insert(&payload.row).execute()) {
             Ok(row_id) => Response::success(request_id, TableInsertResult { row_id }),
-            Err(_) => sdk_error(request_id),
+            Err(error) => sdk_operation_error(request_id, &error),
         }
     }
 
@@ -501,7 +548,7 @@ impl Runtime {
             .block_on(table.select().where_eq(&column, value).all())
         {
             Ok(rows) => Response::success(request_id, TableSelectResult { rows }),
-            Err(_) => sdk_error(request_id),
+            Err(error) => sdk_operation_error(request_id, &error),
         }
     }
 
@@ -801,6 +848,101 @@ impl Runtime {
         }
     }
 
+    fn member_invite(&mut self, request_id: String, payload: Value) -> Response {
+        let payload = match parse_payload::<MemberPayload>(&request_id, payload) {
+            Ok(payload) => payload,
+            Err(response) => return response,
+        };
+        let Some(space) = self.space.as_ref() else {
+            return invalid_state(request_id);
+        };
+        let space_id = space.id().to_string();
+        if payload.space_id != space_id {
+            return invalid_state(request_id);
+        }
+        match self.executor.block_on(space.invite_user()) {
+            Ok(invite) => {
+                let Some(member_id) = invite.id() else {
+                    return internal_error(request_id);
+                };
+                match encode_opaque_ref(&invite) {
+                    Ok(invite) => Response::success(
+                        request_id,
+                        InviteResult {
+                            space_id,
+                            member_id,
+                            invite,
+                        },
+                    ),
+                    Err(()) => internal_error(request_id),
+                }
+            }
+            Err(error) => sdk_operation_error(request_id, &error),
+        }
+    }
+
+    fn member_join(&mut self, request_id: String, payload: Value) -> Response {
+        let payload = match parse_payload::<JoinPayload>(&request_id, payload) {
+            Ok(payload) => payload,
+            Err(response) => return response,
+        };
+        if self.space.is_some() {
+            return invalid_state(request_id);
+        }
+        let invite = match decode_opaque_ref::<SpaceInvite>(&payload.invite) {
+            Ok(invite) => invite,
+            Err(()) => return invalid_request(request_id),
+        };
+        let backend_url = self.process.backend_url.clone();
+        let schema = self.application_schema();
+        let space = match self.executor.block_on(async move {
+            let transport = WebSocketTransport::new(&backend_url).await?;
+            Space::join(transport, invite, schema).await
+        }) {
+            Ok(space) => space,
+            Err(error) => return sdk_operation_error(request_id, &error),
+        };
+        let space_id = space.id().to_string();
+        let Some(member_id) = space.uid().map(i64::from) else {
+            return internal_error(request_id);
+        };
+        self.space = Some(space);
+        Response::success(
+            request_id,
+            JoinResult {
+                space_id,
+                member_id,
+                joined: true,
+            },
+        )
+    }
+
+    fn member_remove(&mut self, request_id: String, payload: Value) -> Response {
+        let payload = match parse_payload::<RemovePayload>(&request_id, payload) {
+            Ok(payload) if payload.member_id > 0 => payload,
+            Ok(_) => return invalid_request(request_id),
+            Err(response) => return response,
+        };
+        let Some(space) = self.space.as_ref() else {
+            return invalid_state(request_id);
+        };
+        let space_id = space.id().to_string();
+        if payload.space_id != space_id {
+            return invalid_state(request_id);
+        }
+        match self.executor.block_on(space.remove_user(payload.member_id)) {
+            Ok(()) => Response::success(
+                request_id,
+                RemoveResult {
+                    space_id,
+                    member_id: payload.member_id,
+                    removed: true,
+                },
+            ),
+            Err(error) => sdk_operation_error(request_id, &error),
+        }
+    }
+
     fn application_schema(&self) -> ApplicationSchema {
         ApplicationSchema::FromOwnedBytes(
             self.process.schema.clone(),
@@ -842,6 +984,31 @@ fn sdk_error(request_id: String) -> Response {
         "SDK_ERROR",
         "encrypted spaces operation failed",
     )
+}
+
+fn sdk_operation_error(request_id: String, error: &SdkErrorType) -> Response {
+    let removed_member = matches!(
+        error,
+        SdkErrorType::ValidationError(message)
+            if message == "no GK delivery slot available for current user"
+    ) || matches!(
+        error,
+        SdkErrorType::DecryptionError(message) if message == "missing key for current key_id"
+    );
+    if matches!(error, SdkErrorType::AccessDenied(_))
+        || removed_member
+        || error
+            .to_string()
+            .to_ascii_lowercase()
+            .contains("access denied")
+    {
+        return Response::error(
+            Some(request_id),
+            "ACCESS_DENIED",
+            "encrypted spaces access denied",
+        );
+    }
+    sdk_error(request_id)
 }
 
 fn internal_error(request_id: String) -> Response {

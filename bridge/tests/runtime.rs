@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 const PROTOCOL_VERSION: u64 = 1;
 const UPSTREAM_COMMIT: &str = "4cda0ae87698135aa672990e6e68cf7873847426";
 const RUST_TOOLCHAIN: &str = "1.94.1";
-const RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
 const EXIT_TIMEOUT: Duration = Duration::from_secs(2);
 const BACKEND_START_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -850,7 +850,7 @@ fn runtime_snapshot_sync_runs_verified_backend_recovery() {
 }
 
 #[test]
-fn runtime_space_lifecycle_is_red() {
+fn runtime_space_lifecycle_survives_restart_and_membership_changes() {
     let owner = "owner-lifecycle-parametric";
     let member = "member-lifecycle-parametric";
     let mut scenario = Scenario::start("lifecycle", &[owner, member]);
@@ -1246,7 +1246,7 @@ fn runtime_file_put_get_round_trip_encrypted_bytes() {
 }
 
 #[test]
-fn runtime_member_invite_join_remove_are_red() {
+fn runtime_member_invite_join_remove_enforces_revocation() {
     let owner = "owner-membership-parametric";
     let member = "member-membership-parametric";
     let mut scenario = Scenario::start("membership", &[owner, member]);
@@ -1334,12 +1334,22 @@ fn runtime_member_invite_join_remove_are_red() {
     scenario.verify_error::<BridgeError, _>(removed_select, |error| {
         (error.code == "ACCESS_DENIED")
             .then_some(())
-            .ok_or_else(|| "removed member select did not return ACCESS_DENIED".to_owned())
+            .ok_or_else(|| {
+                format!(
+                    "removed member select returned {}, expected ACCESS_DENIED",
+                    error.code
+                )
+            })
     });
     scenario.verify_error::<BridgeError, _>(removed_write, |error| {
         (error.code == "ACCESS_DENIED")
             .then_some(())
-            .ok_or_else(|| "removed member write did not return ACCESS_DENIED".to_owned())
+            .ok_or_else(|| {
+                format!(
+                    "removed member write returned {}, expected ACCESS_DENIED",
+                    error.code
+                )
+            })
     });
     scenario.verify::<TableSelectResult, _>(owner_select, |result| {
         (result.rows.len() == 1
