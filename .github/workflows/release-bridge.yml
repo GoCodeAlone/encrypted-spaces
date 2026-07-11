@@ -1,10 +1,8 @@
 name: Bridge Release Contract
 
-# Contract-only RED workflow. It validates the future public release shape but
-# does not publish releases and does not claim release readiness yet.
-# release_ready: false
+# Manual validation only. This workflow does not publish release assets.
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -14,62 +12,44 @@ env:
   UPSTREAM_COMMIT: 4cda0ae87698135aa672990e6e68cf7873847426
   RUST_VERSION: 1.94.1
   RISC0_SKIP_BUILD: 1
-  PROVENANCE: required-before-publish
 
 jobs:
-  contract:
+  legal:
+    name: Legal and source contract
     runs-on: ubuntu-24.04
     steps:
-      - name: Checkout pinned upstream descendant
+      - name: Checkout pinned source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           fetch-depth: 0
 
-      - name: Validate public release contract
+      - name: Verify legal and source records
         shell: bash
         run: |
           set -euo pipefail
           test "$RELEASE_READY" = false
           git merge-base --is-ancestor "$UPSTREAM_COMMIT" "$GITHUB_SHA"
-          grep -Fq 'kdl = { version = "=6.5.0"' Cargo.toml
-          grep -Fq 'version = "6.5.0"' Cargo.lock
-          test -f LICENSE
-          # NOTICE is a deliberate release gate until the legal attribution
-          # file is supplied; this workflow must stay RED before publishing.
-          test -f NOTICE
-          test -f PATCHES.md
+          test -s LICENSE
+          test -s NOTICE
+          test -s PATCHES.md
           grep -Fq "$UPSTREAM_COMMIT" PATCHES.md
           grep -Fq '800495f' PATCHES.md
-          grep -Fq "Rust $RUST_VERSION" PATCHES.md
+          grep -Fq "Rust \`$RUST_VERSION\`" PATCHES.md
+          grep -Fq 'kdl = { version = "=6.5.0"' Cargo.toml
+          grep -Fq 'version = "6.5.0"' Cargo.lock
 
-      - name: Install pinned Rust toolchain and expose matching tools
+      - name: Verify pinned Rust toolchain
         shell: bash
         run: |
           set -euo pipefail
           rustup toolchain install "$RUST_VERSION" --profile minimal
-          RUSTC="$(rustup which --toolchain "$RUST_VERSION" rustc)"
-          RUSTDOC="$(rustup which --toolchain "$RUST_VERSION" rustdoc)"
-          echo "RUSTUP_TOOLCHAIN=$RUST_VERSION" >> "$GITHUB_ENV"
-          echo "RUSTC=$RUSTC" >> "$GITHUB_ENV"
-          echo "RUSTDOC=$RUSTDOC" >> "$GITHUB_ENV"
-          echo "$(dirname "$RUSTC")" >> "$GITHUB_PATH"
-          "$RUSTC" --version | grep -Fq " $RUST_VERSION "
-          "$RUSTDOC" --version | grep -Fq " $RUST_VERSION "
-
-      - name: Validate build and publication markers
-        shell: bash
-        run: |
-          set -euo pipefail
-          grep -Fq 'sha256sum' .github/workflows/release-bridge.yml
-          grep -Fq 'shasum -a 256' .github/workflows/release-bridge.yml
-          grep -Fq 'provenance' .github/workflows/release-bridge.yml
-          grep -Fq 'LICENSE' .github/workflows/release-bridge.yml
-          grep -Fq 'NOTICE' .github/workflows/release-bridge.yml
-          grep -Fq 'does not publish' .github/workflows/release-bridge.yml
+          rustup run "$RUST_VERSION" rustc --version | grep -Fq " $RUST_VERSION "
+          rustup run "$RUST_VERSION" rustdoc --version | grep -Fq " $RUST_VERSION "
 
   assets:
-    needs: contract
+    name: ${{ matrix.archive }}
     strategy:
+      fail-fast: false
       matrix:
         include:
           - component: backend
@@ -81,7 +61,7 @@ jobs:
             target: linux-arm64
             archive: encrypted-spaces-backend-linux-arm64.tar.gz
           - component: backend
-            os: macos-13
+            os: macos-15-intel
             target: macos-amd64
             archive: encrypted-spaces-backend-macos-amd64.tar.gz
           - component: backend
@@ -97,7 +77,7 @@ jobs:
             target: linux-arm64
             archive: encrypted-spaces-bridge-linux-arm64.tar.gz
           - component: bridge
-            os: macos-13
+            os: macos-15-intel
             target: macos-amd64
             archive: encrypted-spaces-bridge-macos-amd64.tar.gz
           - component: bridge
@@ -106,30 +86,105 @@ jobs:
             archive: encrypted-spaces-bridge-macos-arm64.tar.gz
     runs-on: ${{ matrix.os }}
     steps:
-      - name: Checkout release contents
+      - name: Checkout pinned source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
 
-      - name: Verify dist release contract
+      - name: Verify release asset
         shell: bash
         env:
           DIST_CONTRACT: dist
+          COMPONENT: ${{ matrix.component }}
+          TARGET: ${{ matrix.target }}
           ARCHIVE: ${{ matrix.archive }}
         run: |
           set -euo pipefail
           archive="$DIST_CONTRACT/$ARCHIVE"
           checksum="$DIST_CONTRACT/checksums/$ARCHIVE.sha256"
           provenance="$DIST_CONTRACT/provenance/$ARCHIVE.intoto.jsonl"
-          license="$DIST_CONTRACT/LICENSE"
-          notice="$DIST_CONTRACT/NOTICE"
           manifest="$DIST_CONTRACT/release-manifest.json"
           test -s "$manifest"
           test -s "$archive"
           test -s "$checksum"
           test -s "$provenance"
-          test -s "$license"
-          test -s "$notice"
-          grep -Fq "$ARCHIVE" "$manifest"
-          grep -Fq "$ARCHIVE" "$checksum"
-          grep -Fq "$ARCHIVE" "$provenance"
-          grep -Fq 'Apache License' "$license"
-          grep -Fq 'Apache' "$notice"
+
+          jq -e \
+            --arg component "$COMPONENT" \
+            --arg target "$TARGET" \
+            --arg archive "$ARCHIVE" \
+            --arg upstream "$UPSTREAM_COMMIT" \
+            --arg toolchain "$RUST_VERSION" '
+              .upstream_commit == $upstream and
+              .rust_toolchain == $toolchain and
+              (.artifacts | length == 8) and
+              ([.artifacts[].archive] | unique | length == 8) and
+              ([.artifacts[] | select(
+                .component == $component and
+                .target == $target and
+                .archive == $archive and
+                (.sha256 | test("^[0-9a-f]{64}$"))
+              )] | length == 1)
+            ' "$manifest"
+          manifest_digest="$(jq -er \
+            --arg component "$COMPONENT" \
+            --arg target "$TARGET" \
+            --arg archive "$ARCHIVE" '
+              .artifacts[] |
+              select(
+                .component == $component and
+                .target == $target and
+                .archive == $archive
+              ) |
+              .sha256
+            ' "$manifest")"
+
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            actual_digest="$(sha256sum "$archive" | awk '{print $1}')"
+            (cd "$DIST_CONTRACT" && sha256sum -c "checksums/$ARCHIVE.sha256")
+          elif [[ "$RUNNER_OS" == macOS ]]; then
+            actual_digest="$(shasum -a 256 "$archive" | awk '{print $1}')"
+            (cd "$DIST_CONTRACT" && shasum -a 256 -c "checksums/$ARCHIVE.sha256")
+          else
+            echo "unsupported checksum platform: $RUNNER_OS" >&2
+            exit 1
+          fi
+          test "$actual_digest" = "$manifest_digest"
+
+          jq -se \
+            --arg archive "$ARCHIVE" \
+            --arg digest "$actual_digest" \
+            --arg upstream "$UPSTREAM_COMMIT" \
+            --arg toolchain "$RUST_VERSION" '
+              length > 0 and any(.[];
+                ._type == "https://in-toto.io/Statement/v1" and
+                .predicateType == "https://slsa.dev/provenance/v1" and
+                any(.subject[]?;
+                  .name == $archive and .digest.sha256 == $digest
+                ) and
+                .predicate.buildDefinition.externalParameters.upstream_commit == $upstream and
+                .predicate.buildDefinition.externalParameters.rust_toolchain == $toolchain
+              )
+            ' "$provenance"
+
+          listing="$(tar -tzf "$archive")"
+          for required in "encrypted-spaces-$COMPONENT" LICENSE NOTICE; do
+            awk -F/ -v required="$required" '
+              $NF == required { found = 1 }
+              END { exit !found }
+            ' <<< "$listing"
+          done
+
+  aggregate:
+    name: Release contract result
+    if: ${{ always() }}
+    needs: [legal, assets]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require all release gates
+        shell: bash
+        env:
+          LEGAL_RESULT: ${{ needs.legal.result }}
+          ASSET_RESULT: ${{ needs.assets.result }}
+        run: |
+          set -euo pipefail
+          test "$LEGAL_RESULT" = success
+          test "$ASSET_RESULT" = success
