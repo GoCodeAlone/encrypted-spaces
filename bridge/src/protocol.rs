@@ -1,10 +1,22 @@
 use crate::runtime;
 use crate::schema::{Operation, Request, MAX_REQUEST_ID_BYTES, PROTOCOL_VERSION};
-use serde::Serialize;
-use serde_json::Value;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::io::{self, BufRead, Read, Write};
+use std::sync::{
+    atomic::{AtomicU8, Ordering},
+    Arc, Mutex,
+};
+use std::thread;
+use std::time::Duration;
 
 pub const MAX_FRAME_BYTES: usize = 64 * 1024;
+const MAX_PENDING_REQUESTS: usize = 64;
+const MAX_WAIT_FOR_CHANGE_MS: u64 = 60_000;
+const PENDING: u8 = 0;
+const CANCELED: u8 = 1;
+const COMPLETING: u8 = 2;
 
 #[derive(Debug, Serialize)]
 pub struct Response {
@@ -65,32 +77,189 @@ enum FrameError {
     Io(io::Error),
 }
 
-pub fn run<R: Read, W: Write>(reader: R, mut writer: W) -> io::Result<()> {
-    let mut runtime = runtime::Runtime::from_env()?;
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WaitSyncPayload {
+    space_id: String,
+    wait_for_change_ms: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CancelPayload {
+    request_id: String,
+}
+
+#[derive(Serialize)]
+struct CancelResult {
+    canceled: bool,
+}
+
+pub fn run<R: Read, W: Write + Send + 'static>(reader: R, writer: W) -> io::Result<()> {
+    let runtime = Arc::new(Mutex::new(runtime::Runtime::from_env()?));
+    let writer = Arc::new(Mutex::new(writer));
+    let mut pending = HashMap::<String, Arc<AtomicU8>>::new();
     let mut reader = io::BufReader::new(reader);
     loop {
         let frame = match read_frame(&mut reader) {
             Ok(Some(frame)) => frame,
             Ok(None) => return Ok(()),
             Err(FrameError::TooLarge) => {
-                write_response(
-                    &mut writer,
+                write_shared_response(
+                    &writer,
                     Response::error(None, "FRAME_TOO_LARGE", "JSONL frame exceeds maximum size"),
                 )?;
                 return Ok(());
             }
             Err(FrameError::Io(error)) => return Err(error),
         };
+        pending.retain(|_, state| state.load(Ordering::Acquire) == PENDING);
 
-        let response = match decode_request(&frame) {
-            Ok(request) => runtime.dispatch(request),
-            Err(response) => response,
+        let request = match decode_request(&frame) {
+            Ok(request) => request,
+            Err(response) => {
+                write_shared_response(&writer, response)?;
+                continue;
+            }
         };
-        write_response(&mut writer, response)?;
-        if runtime.should_shutdown() {
+
+        if matches!(request.operation, Operation::Cancel) {
+            cancel_pending(request, &mut pending, &writer)?;
+            continue;
+        }
+        if matches!(request.operation, Operation::Sync)
+            && request.payload.get("wait_for_change_ms").is_some()
+        {
+            schedule_wait_sync(
+                request,
+                &mut pending,
+                Arc::clone(&runtime),
+                Arc::clone(&writer),
+            )?;
+            continue;
+        }
+
+        let (response, shutdown) = {
+            let mut runtime = runtime
+                .lock()
+                .map_err(|_| io::Error::other("runtime lock poisoned"))?;
+            let response = runtime.dispatch(request);
+            (response, runtime.should_shutdown())
+        };
+        write_shared_response(&writer, response)?;
+        if shutdown {
             return Ok(());
         }
     }
+}
+
+fn schedule_wait_sync<W: Write + Send + 'static>(
+    request: Request,
+    pending: &mut HashMap<String, Arc<AtomicU8>>,
+    runtime: Arc<Mutex<runtime::Runtime>>,
+    writer: Arc<Mutex<W>>,
+) -> io::Result<()> {
+    let request_id = request.request_id;
+    let payload = match serde_json::from_value::<WaitSyncPayload>(request.payload) {
+        Ok(payload)
+            if payload.wait_for_change_ms > 0
+                && payload.wait_for_change_ms <= MAX_WAIT_FOR_CHANGE_MS =>
+        {
+            payload
+        }
+        _ => {
+            return write_shared_response(
+                &writer,
+                Response::error(
+                    Some(request_id),
+                    "INVALID_REQUEST",
+                    "invalid bridge request",
+                ),
+            );
+        }
+    };
+    if pending.len() >= MAX_PENDING_REQUESTS || pending.contains_key(&request_id) {
+        return write_shared_response(
+            &writer,
+            Response::error(
+                Some(request_id),
+                "TOO_MANY_PENDING",
+                "pending bridge request limit reached",
+            ),
+        );
+    }
+
+    let state = Arc::new(AtomicU8::new(PENDING));
+    pending.insert(request_id.clone(), Arc::clone(&state));
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(payload.wait_for_change_ms));
+        if state
+            .compare_exchange(PENDING, COMPLETING, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let response = match runtime.lock() {
+            Ok(mut runtime) => runtime.dispatch(Request {
+                version: PROTOCOL_VERSION,
+                request_id,
+                operation: Operation::Sync,
+                payload: json!({"space_id": payload.space_id}),
+            }),
+            Err(_) => return,
+        };
+        let _ = write_shared_response(&writer, response);
+    });
+    Ok(())
+}
+
+fn cancel_pending<W: Write>(
+    request: Request,
+    pending: &mut HashMap<String, Arc<AtomicU8>>,
+    writer: &Arc<Mutex<W>>,
+) -> io::Result<()> {
+    let payload = match serde_json::from_value::<CancelPayload>(request.payload) {
+        Ok(payload) if !payload.request_id.is_empty() => payload,
+        _ => {
+            return write_shared_response(
+                writer,
+                Response::error(
+                    Some(request.request_id),
+                    "INVALID_REQUEST",
+                    "invalid bridge request",
+                ),
+            );
+        }
+    };
+    let canceled = pending.remove(&payload.request_id).is_some_and(|state| {
+        state
+            .compare_exchange(PENDING, CANCELED, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    });
+    let mut writer = writer
+        .lock()
+        .map_err(|_| io::Error::other("writer lock poisoned"))?;
+    if canceled {
+        write_response(
+            &mut *writer,
+            Response::error(
+                Some(payload.request_id),
+                "CANCELED",
+                "bridge request canceled",
+            ),
+        )?;
+    }
+    write_response(
+        &mut *writer,
+        Response::success(request.request_id, CancelResult { canceled }),
+    )
+}
+
+fn write_shared_response<W: Write>(writer: &Arc<Mutex<W>>, response: Response) -> io::Result<()> {
+    let mut writer = writer
+        .lock()
+        .map_err(|_| io::Error::other("writer lock poisoned"))?;
+    write_response(&mut *writer, response)
 }
 
 fn decode_request(frame: &[u8]) -> Result<Request, Response> {

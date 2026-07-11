@@ -850,6 +850,26 @@ fn runtime_snapshot_sync_runs_verified_backend_recovery() {
 }
 
 #[test]
+fn runtime_sync_wait_wakes_and_runs_verified_recovery() {
+    let actor = "actor-sync-wait-parametric";
+    let mut scenario = Scenario::start("sync-wait", &[actor]);
+    let create = scenario.request(actor, "space.create", json!({}));
+    let space_id = scenario.returned_string(create, "space_id", "missing-wait-space");
+    let sync = scenario.request(
+        actor,
+        "space.sync",
+        json!({"space_id": space_id, "wait_for_change_ms": 25}),
+    );
+
+    scenario.verify::<SyncResult, _>(sync, |result| {
+        (result.space_id == space_id && result.synced)
+            .then_some(())
+            .ok_or_else(|| "waited space.sync did not run verified recovery".to_owned())
+    });
+    scenario.finish();
+}
+
+#[test]
 fn runtime_space_lifecycle_survives_restart_and_membership_changes() {
     let owner = "owner-lifecycle-parametric";
     let member = "member-lifecycle-parametric";

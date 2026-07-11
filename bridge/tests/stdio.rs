@@ -372,7 +372,7 @@ fn protocol_unknown_operation_is_distinct_from_malformed_json() {
 }
 
 #[test]
-fn protocol_cancellation_interrupts_sync_and_keeps_process_usable_is_red() {
+fn protocol_cancellation_interrupts_sync_and_keeps_process_usable() {
     let mut bridge = Bridge::spawn(DEFAULT_ACTOR_ID);
     bridge.send_request("hello-before-cancel", "hello", json!({}));
     assert_future_success(&bridge.receive(), "hello");
