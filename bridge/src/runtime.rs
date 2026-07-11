@@ -1,5 +1,6 @@
 use crate::protocol::Response;
 use crate::schema::{Operation, Request, PROTOCOL_VERSION};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use encrypted_spaces_sdk::{ApplicationSchema, LocalTransport, Space, WebSocketTransport};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
@@ -84,6 +85,38 @@ struct TableSelectPayload {
     where_clause: serde_json::Map<String, Value>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ListCreatePayload {
+    space_id: String,
+    table: String,
+    row_id: i64,
+    column: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ListAppendPayload {
+    space_id: String,
+    list_ref: String,
+    value: Value,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ListReadPayload {
+    space_id: String,
+    list_ref: String,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ListRef {
+    table: String,
+    row_id: i64,
+    column: String,
+}
+
 #[derive(Serialize)]
 struct CreateResult<'a> {
     space_id: String,
@@ -116,6 +149,36 @@ struct TableInsertResult {
 #[derive(Serialize)]
 struct TableSelectResult {
     rows: Vec<Value>,
+}
+
+#[derive(Serialize)]
+struct ListCreateResult {
+    space_id: String,
+    table: String,
+    row_id: i64,
+    column: String,
+    list_ref: String,
+}
+
+#[derive(Serialize)]
+struct ListAppendResult {
+    space_id: String,
+    list_ref: String,
+    item_ref: String,
+}
+
+#[derive(Serialize)]
+struct ListItemResult {
+    item_ref: String,
+    position: u64,
+    value: Value,
+}
+
+#[derive(Serialize)]
+struct ListReadResult {
+    space_id: String,
+    list_ref: String,
+    items: Vec<ListItemResult>,
 }
 
 impl Runtime {
@@ -184,6 +247,9 @@ impl Runtime {
             Operation::Sync => self.sync(request.request_id, request.payload),
             Operation::TableInsert => self.table_insert(request.request_id, request.payload),
             Operation::TableSelect => self.table_select(request.request_id, request.payload),
+            Operation::ListCreate => self.list_create(request.request_id, request.payload),
+            Operation::ListAppend => self.list_append(request.request_id, request.payload),
+            Operation::ListRead => self.list_read(request.request_id, request.payload),
             operation => {
                 let _operation_name = operation.name();
                 let _ = request.payload;
@@ -347,6 +413,116 @@ impl Runtime {
         }
     }
 
+    fn list_create(&mut self, request_id: String, payload: Value) -> Response {
+        let payload = match parse_payload::<ListCreatePayload>(&request_id, payload) {
+            Ok(payload)
+                if !payload.table.is_empty()
+                    && payload.row_id > 0
+                    && !payload.column.is_empty() =>
+            {
+                payload
+            }
+            Ok(_) => return invalid_request(request_id),
+            Err(response) => return response,
+        };
+        let Some(space) = self.space.as_ref() else {
+            return invalid_state(request_id);
+        };
+        let space_id = space.id().to_string();
+        if payload.space_id != space_id {
+            return invalid_state(request_id);
+        }
+        let list = space.list::<Value>(&payload.table, payload.row_id, &payload.column);
+        if self.executor.block_on(list.get_all()).is_err() {
+            return sdk_error(request_id);
+        }
+        let list_ref = match encode_opaque_ref(&ListRef {
+            table: payload.table.clone(),
+            row_id: payload.row_id,
+            column: payload.column.clone(),
+        }) {
+            Ok(list_ref) => list_ref,
+            Err(()) => return internal_error(request_id),
+        };
+        Response::success(
+            request_id,
+            ListCreateResult {
+                space_id,
+                table: payload.table,
+                row_id: payload.row_id,
+                column: payload.column,
+                list_ref,
+            },
+        )
+    }
+
+    fn list_append(&mut self, request_id: String, payload: Value) -> Response {
+        let payload = match parse_payload::<ListAppendPayload>(&request_id, payload) {
+            Ok(payload) => payload,
+            Err(response) => return response,
+        };
+        let list_ref = match decode_opaque_ref::<ListRef>(&payload.list_ref) {
+            Ok(list_ref) => list_ref,
+            Err(()) => return invalid_request(request_id),
+        };
+        let Some(space) = self.space.as_ref() else {
+            return invalid_state(request_id);
+        };
+        let space_id = space.id().to_string();
+        if payload.space_id != space_id {
+            return invalid_state(request_id);
+        }
+        let list = space.list::<Value>(&list_ref.table, list_ref.row_id, &list_ref.column);
+        match self.executor.block_on(list.append(&payload.value)) {
+            Ok(item_ref) => Response::success(
+                request_id,
+                ListAppendResult {
+                    space_id,
+                    list_ref: payload.list_ref,
+                    item_ref: URL_SAFE_NO_PAD.encode(item_ref),
+                },
+            ),
+            Err(_) => sdk_error(request_id),
+        }
+    }
+
+    fn list_read(&mut self, request_id: String, payload: Value) -> Response {
+        let payload = match parse_payload::<ListReadPayload>(&request_id, payload) {
+            Ok(payload) => payload,
+            Err(response) => return response,
+        };
+        let list_ref = match decode_opaque_ref::<ListRef>(&payload.list_ref) {
+            Ok(list_ref) => list_ref,
+            Err(()) => return invalid_request(request_id),
+        };
+        let Some(space) = self.space.as_ref() else {
+            return invalid_state(request_id);
+        };
+        let space_id = space.id().to_string();
+        if payload.space_id != space_id {
+            return invalid_state(request_id);
+        }
+        let list = space.list::<Value>(&list_ref.table, list_ref.row_id, &list_ref.column);
+        match self.executor.block_on(list.get_all()) {
+            Ok(entries) => Response::success(
+                request_id,
+                ListReadResult {
+                    space_id,
+                    list_ref: payload.list_ref,
+                    items: entries
+                        .into_iter()
+                        .map(|entry| ListItemResult {
+                            item_ref: URL_SAFE_NO_PAD.encode(entry.key),
+                            position: entry.position,
+                            value: entry.value,
+                        })
+                        .collect(),
+                },
+            ),
+            Err(_) => sdk_error(request_id),
+        }
+    }
+
     fn application_schema(&self) -> ApplicationSchema {
         ApplicationSchema::FromOwnedBytes(
             self.process.schema.clone(),
@@ -388,6 +564,25 @@ fn sdk_error(request_id: String) -> Response {
         "SDK_ERROR",
         "encrypted spaces operation failed",
     )
+}
+
+fn internal_error(request_id: String) -> Response {
+    Response::error(
+        Some(request_id),
+        "INTERNAL_ERROR",
+        "bridge operation failed",
+    )
+}
+
+fn encode_opaque_ref(value: &impl Serialize) -> Result<String, ()> {
+    serde_json::to_vec(value)
+        .map(|bytes| URL_SAFE_NO_PAD.encode(bytes))
+        .map_err(|_| ())
+}
+
+fn decode_opaque_ref<T: DeserializeOwned>(value: &str) -> Result<T, ()> {
+    let bytes = URL_SAFE_NO_PAD.decode(value).map_err(|_| ())?;
+    serde_json::from_slice(&bytes).map_err(|_| ())
 }
 
 fn required_env(name: &str) -> io::Result<String> {

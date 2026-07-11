@@ -11,6 +11,7 @@ name = "encrypted-spaces-bridge"
 path = "src/main.rs"
 
 [dependencies]
+base64.workspace = true
 encrypted-spaces-ffproof = { workspace = true, features = ["prove"] }
 encrypted-spaces-sdk = { workspace = true, features = ["local-transport"] }
 serde.workspace = true

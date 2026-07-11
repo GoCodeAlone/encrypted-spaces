@@ -1041,7 +1041,7 @@ fn runtime_table_insert_select_round_trip_verified_rows() {
 }
 
 #[test]
-fn runtime_list_create_append_read_are_red() {
+fn runtime_list_create_append_read_round_trip() {
     let actor = "actor-list-parametric";
     let label = "list-parent-parametric";
     let rank = 73;
