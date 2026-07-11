@@ -1,0 +1,80 @@
+name: Weekly Upstream Sync
+
+on:
+  schedule:
+    - cron: '17 9 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout fork main
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Fetch upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/encrypted-spaces/prototype.git
+          git fetch upstream main
+
+      - name: Open or reuse compatibility PR
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "Fork already contains upstream main"
+            echo "url=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          upstream_sha="$(git rev-parse upstream/main)"
+          branch="automation/upstream-sync-${upstream_sha:0:12}"
+          existing="$(gh pr list \
+            --repo "$GITHUB_REPOSITORY" \
+            --state open \
+            --head "$branch" \
+            --json url \
+            --jq '.[0].url // empty')"
+          if [[ -n "$existing" ]]; then
+            echo "url=$existing" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git push origin "upstream/main:refs/heads/$branch"
+          url="$(gh pr create \
+            --repo "$GITHUB_REPOSITORY" \
+            --base main \
+            --head "$branch" \
+            --title "chore: sync encrypted-spaces upstream" \
+            --body "Automated weekly compatibility update to upstream commit \`$upstream_sha\`. Normal pull-request checks validate the fork delta and runtime bridge.")"
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+
+      - name: Enable squash automerge when compatible
+        if: steps.pr.outputs.url != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_URL: ${{ steps.pr.outputs.url }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh pr merge "$PR_URL" --auto --squash --delete-branch; then
+            echo "Automerge enabled for $PR_URL"
+          else
+            echo "$PR_URL remains open for conflicts, failing checks, or review"
+          fi

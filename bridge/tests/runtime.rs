@@ -1504,3 +1504,25 @@ fn release_contract_builds_and_publishes_native_assets() {
     assert!(!patches.contains("Pending Release Work"));
     assert!(!patches.contains("NOT_IMPLEMENTED"));
 }
+
+#[test]
+fn upstream_sync_opens_ci_gated_automerge_prs() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let workflow = fs::read_to_string(root.join(".github/workflows/upstream-sync.yml"))
+        .expect("upstream sync workflow");
+
+    assert!(workflow.contains("schedule:"));
+    assert!(workflow.contains("cron:"));
+    assert!(workflow.contains("workflow_dispatch:"));
+    assert!(workflow.contains("contents: write"));
+    assert!(workflow.contains("pull-requests: write"));
+    assert!(workflow.contains("https://github.com/encrypted-spaces/prototype.git"));
+    assert!(workflow.contains("git fetch upstream main"));
+    assert!(workflow.contains("upstream/main"));
+    assert!(workflow.contains("gh pr create"));
+    assert!(workflow.contains("gh pr merge"));
+    assert!(workflow.contains("--auto"));
+    assert!(workflow.contains("--squash"));
+    assert!(workflow.contains("remains open"));
+    assert_pinned_actions(&workflow);
+}
