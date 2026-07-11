@@ -1151,6 +1151,7 @@ fn runtime_member_invite_join_remove_are_red() {
 
 #[derive(Deserialize)]
 struct ReleaseManifest {
+    version: String,
     upstream_commit: String,
     rust_toolchain: String,
     artifacts: Vec<ReleaseArtifact>,
@@ -1161,6 +1162,8 @@ struct ReleaseArtifact {
     component: String,
     target: String,
     archive: String,
+    binary: String,
+    version: String,
     sha256: String,
 }
 
@@ -1308,26 +1311,126 @@ fn verify_checksum(dist: &Path, archive: &str, expected_digest: &str) {
     );
 }
 
-fn inspect_archive(dist: &Path, component: &str, archive: &str) {
-    let output = Command::new("tar")
-        .args(["-tzf", archive])
-        .current_dir(dist)
+fn find_file(root: &Path, name: &str) -> Option<PathBuf> {
+    for entry in fs::read_dir(root).ok()? {
+        let path = entry.ok()?.path();
+        if path.is_dir() {
+            if let Some(found) = find_file(&path, name) {
+                return Some(found);
+            }
+        } else if path.file_name().and_then(|value| value.to_str()) == Some(name) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn native_target() -> Option<&'static str> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("linux", "x86_64") => Some("linux-amd64"),
+        ("linux", "aarch64") => Some("linux-arm64"),
+        ("macos", "x86_64") => Some("macos-amd64"),
+        ("macos", "aarch64") => Some("macos-arm64"),
+        _ => None,
+    }
+}
+
+fn assert_binary_format(binary: &Path, target: &str) {
+    let output = Command::new("file")
+        .args(["-b", binary.to_str().expect("binary path is UTF-8")])
         .output()
-        .expect("list release archive");
+        .expect("inspect release binary format");
     assert!(
         output.status.success(),
-        "cannot list {archive}: {}",
+        "file failed for {}",
+        binary.display()
+    );
+    let description = String::from_utf8(output.stdout).expect("file output is UTF-8");
+    let valid = match target {
+        "linux-amd64" => {
+            description.contains("ELF 64-bit")
+                && (description.contains("x86-64") || description.contains("x86_64"))
+        }
+        "linux-arm64" => {
+            description.contains("ELF 64-bit")
+                && (description.contains("ARM aarch64") || description.contains("aarch64"))
+        }
+        "macos-amd64" => description.contains("Mach-O 64-bit") && description.contains("x86_64"),
+        "macos-arm64" => description.contains("Mach-O 64-bit") && description.contains("arm64"),
+        _ => false,
+    };
+    assert!(valid, "{target} has wrong binary format: {description}");
+}
+
+fn assert_native_version(binary: &Path, version: &str) {
+    let script = r#"
+import subprocess
+import sys
+result = subprocess.run([sys.argv[1], "--version"], check=True, capture_output=True, text=True, timeout=5)
+output = result.stdout + result.stderr
+if sys.argv[2] not in output:
+    raise SystemExit(f"version output does not contain {sys.argv[2]}: {output!r}")
+"#;
+    let status = Command::new("python3")
+        .args([
+            "-c",
+            script,
+            binary.to_str().expect("binary path is UTF-8"),
+            version,
+        ])
+        .status()
+        .expect("run release binary version check");
+    assert!(
+        status.success(),
+        "{} version check failed",
+        binary.display()
+    );
+}
+
+fn inspect_archive(dist: &Path, component: &str, target: &str, archive: &str, version: &str) {
+    let extraction = tempfile::tempdir().expect("create archive extraction directory");
+    let output = Command::new("tar")
+        .args([
+            "-xzf",
+            archive,
+            "-C",
+            extraction
+                .path()
+                .to_str()
+                .expect("extraction path is UTF-8"),
+        ])
+        .current_dir(dist)
+        .output()
+        .expect("extract release archive");
+    assert!(
+        output.status.success(),
+        "cannot extract {archive}: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let listing = String::from_utf8(output.stdout).expect("archive listing is UTF-8");
     let binary = format!("encrypted-spaces-{component}");
     for required in [binary.as_str(), "LICENSE", "NOTICE"] {
         assert!(
-            listing
-                .lines()
-                .any(|entry| entry.trim_end_matches('/').rsplit('/').next() == Some(required)),
+            find_file(extraction.path(), required).is_some(),
             "{archive} omits {required}"
         );
+    }
+    let binary = find_file(extraction.path(), &binary).expect("release binary");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_ne!(
+            fs::metadata(&binary)
+                .expect("release binary metadata")
+                .permissions()
+                .mode()
+                & 0o111,
+            0,
+            "{archive} binary is not executable"
+        );
+    }
+    assert_binary_format(&binary, target);
+    if native_target() == Some(target) {
+        assert_native_version(&binary, version);
     }
 }
 
@@ -1403,6 +1506,14 @@ fn release_contract_is_red_until_dist_and_notice_exist() {
         "shasum -a 256 -c",
         "jq -e",
         "tar -tzf",
+        "rustup run \"$RUST_VERSION\" cargo test --locked",
+        "rustup run \"$RUST_VERSION\" cargo build --locked --release",
+        "test -x \"$built\"",
+        "cmp \"$BUILT_BINARY\" \"$packaged\"",
+        "file -b",
+        "subprocess.run(",
+        "--version",
+        "RELEASE_VERSION: 0.1.0",
         "RISC0_SKIP_BUILD: 1",
     ] {
         assert!(workflow.contains(marker), "release workflow omits {marker}");
@@ -1458,6 +1569,7 @@ fn release_contract_is_red_until_dist_and_notice_exist() {
     let manifest: ReleaseManifest =
         serde_json::from_slice(&fs::read(&manifest_path).expect("read release manifest"))
             .expect("parse release manifest");
+    assert_eq!(manifest.version, "0.1.0");
     assert_eq!(manifest.upstream_commit, UPSTREAM_COMMIT);
     assert_eq!(manifest.rust_toolchain, RUST_TOOLCHAIN);
     assert_eq!(manifest.artifacts.len(), RELEASE_ARCHIVES.len());
@@ -1469,9 +1581,15 @@ fn release_contract_is_red_until_dist_and_notice_exist() {
             .unwrap_or_else(|| panic!("release manifest omits {archive}"));
         assert_eq!(artifact.component, component, "{archive} component");
         assert_eq!(artifact.target, target, "{archive} target");
+        assert_eq!(
+            artifact.binary,
+            format!("encrypted-spaces-{component}"),
+            "{archive} binary"
+        );
+        assert_eq!(artifact.version, manifest.version, "{archive} version");
         assert!(valid_digest(&artifact.sha256), "{archive} invalid sha256");
         verify_checksum(&dist, archive, &artifact.sha256);
         verify_provenance(&dist, archive, &artifact.sha256);
-        inspect_archive(&dist, component, archive);
+        inspect_archive(&dist, component, target, archive, &manifest.version);
     }
 }
