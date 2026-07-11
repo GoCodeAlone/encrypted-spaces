@@ -12,6 +12,8 @@ pub struct Response {
     pub request_id: Option<String>,
     pub ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<ErrorBody>,
 }
 
@@ -27,7 +29,25 @@ impl Response {
             version: PROTOCOL_VERSION,
             request_id,
             ok: false,
+            result: None,
             error: Some(ErrorBody { code, message }),
+        }
+    }
+
+    pub fn success(request_id: String, result: impl Serialize) -> Self {
+        match serde_json::to_value(result) {
+            Ok(result) => Self {
+                version: PROTOCOL_VERSION,
+                request_id: Some(request_id),
+                ok: true,
+                result: Some(result),
+                error: None,
+            },
+            Err(_) => Self::error(
+                Some(request_id),
+                "INTERNAL_ERROR",
+                "bridge response serialization failed",
+            ),
         }
     }
 
@@ -46,6 +66,7 @@ enum FrameError {
 }
 
 pub fn run<R: Read, W: Write>(reader: R, mut writer: W) -> io::Result<()> {
+    let mut runtime = runtime::Runtime::from_env()?;
     let mut reader = io::BufReader::new(reader);
     loop {
         let frame = match read_frame(&mut reader) {
@@ -62,7 +83,7 @@ pub fn run<R: Read, W: Write>(reader: R, mut writer: W) -> io::Result<()> {
         };
 
         let response = match decode_request(&frame) {
-            Ok(request) => runtime::dispatch(request),
+            Ok(request) => runtime.dispatch(request),
             Err(response) => response,
         };
         write_response(&mut writer, response)?;
