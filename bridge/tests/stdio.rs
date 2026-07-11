@@ -30,6 +30,10 @@ impl Bridge {
     fn spawn(actor_id: &str) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_encrypted-spaces-bridge"))
             .env("ENCRYPTED_SPACES_ACTOR_ID", actor_id)
+            .env(
+                "ENCRYPTED_SPACES_SCHEMA_PATH",
+                concat!(env!("CARGO_MANIFEST_DIR"), "/../demos/tauri/app_schema.kdl"),
+            )
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -421,6 +425,44 @@ fn protocol_validation_errors_redact_secret_material() {
     let (status, stderr) = bridge.finish();
     assert!(status.success(), "bridge exited with {status}");
     assert!(!stderr.contains(secret), "secret leaked in bridge stderr");
+}
+
+#[test]
+fn protocol_runtime_sdk_errors_are_deterministic_and_redacted_is_red() {
+    let secrets = ["runtime-secret-alpha", "runtime-secret-beta"];
+    let mut bridge = Bridge::spawn(DEFAULT_ACTOR_ID);
+
+    for (index, secret) in secrets.iter().enumerate() {
+        bridge.send_request(
+            &format!("restore-secret-{index}"),
+            "space.restore",
+            json!({"snapshot": {"secret": secret}}),
+        );
+    }
+
+    let responses = [bridge.receive(), bridge.receive()];
+    for (index, response) in responses.iter().enumerate() {
+        assert_eq!(response["request_id"], format!("restore-secret-{index}"));
+        assert_eq!(response["ok"], false);
+        assert_eq!(response["error"]["code"], "SDK_ERROR");
+        assert_eq!(
+            response["error"]["message"],
+            "encrypted spaces operation failed"
+        );
+        for secret in secrets {
+            assert!(
+                !response.to_string().contains(secret),
+                "secret leaked in runtime response"
+            );
+        }
+    }
+    assert_eq!(responses[0]["error"], responses[1]["error"]);
+
+    let (status, stderr) = bridge.finish();
+    assert!(status.success(), "bridge exited with {status}");
+    for secret in secrets {
+        assert!(!stderr.contains(secret), "secret leaked in bridge stderr");
+    }
 }
 
 #[test]

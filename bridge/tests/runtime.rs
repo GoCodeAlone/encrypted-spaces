@@ -221,6 +221,10 @@ impl Scenario {
 #[derive(Deserialize)]
 struct HelloResult {
     protocol_version: u64,
+    actor_id: String,
+    schema_sha256: String,
+    data_commitment: String,
+    ff_guest_image_id: Vec<u32>,
 }
 
 #[derive(Deserialize)]
@@ -426,6 +430,25 @@ fn runtime_request_actor_override_is_rejected() {
 }
 
 #[test]
+fn runtime_request_trust_override_is_rejected() {
+    let mut bridge = BridgeProcess::spawn("trust-override", "actor-trust-parametric");
+    let observation = bridge.exchange(
+        "space.create",
+        json!({
+            "schema_kdl": "table \"attacker\" {}",
+            "data_commitment": "00".repeat(32),
+            "ff_guest_image_id": [1, 2, 3, 4, 5, 6, 7, 8],
+        }),
+    );
+    bridge.finish();
+
+    assert_eq!(observation.response["version"], PROTOCOL_VERSION);
+    assert_eq!(observation.response["request_id"], observation.request_id);
+    assert_eq!(observation.response["ok"], false);
+    assert_eq!(observation.response["error"]["code"], "INVALID_REQUEST");
+}
+
+#[test]
 fn runtime_space_lifecycle_is_red() {
     let owner = "owner-lifecycle-parametric";
     let member = "member-lifecycle-parametric";
@@ -434,6 +457,20 @@ fn runtime_space_lifecycle_is_red() {
     let hello = scenario.request(owner, "hello", json!({}));
     let create = scenario.request(owner, "space.create", create_payload());
     let space_id = scenario.returned_string(create, "space_id", "missing-lifecycle-space");
+    let snapshot_label = "snapshot-state-parametric";
+    let snapshot_rank = 211;
+    let snapshot_insert = scenario.request(
+        owner,
+        "table.insert",
+        json!({
+            "space_id": space_id,
+            "table": TABLE,
+            "row": parent_row(snapshot_label, snapshot_rank),
+        }),
+    );
+    let snapshot_row_id = scenario.observations[snapshot_insert].response["result"]["row_id"]
+        .as_i64()
+        .unwrap_or(-1);
     let snapshot = scenario.request(owner, "space.snapshot", json!({"space_id": space_id}));
     let snapshot_value = scenario.returned_value(
         snapshot,
@@ -441,6 +478,15 @@ fn runtime_space_lifecycle_is_red() {
         json!({"missing": "lifecycle-snapshot"}),
     );
     let restore = scenario.request(owner, "space.restore", json!({"snapshot": snapshot_value}));
+    let restored_select = scenario.request(
+        owner,
+        "table.select",
+        json!({
+            "space_id": space_id,
+            "table": TABLE,
+            "where": {"id": snapshot_row_id},
+        }),
+    );
     let invite = scenario.request(owner, "member.invite", json!({"space_id": space_id}));
     let member_id = scenario.observations[invite].response["result"]["member_id"]
         .as_i64()
@@ -456,9 +502,13 @@ fn runtime_space_lifecycle_is_red() {
     );
 
     scenario.verify::<HelloResult, _>(hello, |result| {
-        (result.protocol_version == PROTOCOL_VERSION)
+        (result.protocol_version == PROTOCOL_VERSION
+            && result.actor_id == owner
+            && valid_digest(&result.schema_sha256)
+            && valid_digest(&result.data_commitment)
+            && result.ff_guest_image_id.len() == 8)
             .then_some(())
-            .ok_or_else(|| "hello returned the wrong protocol version".to_owned())
+            .ok_or_else(|| "hello returned invalid process-bound trust metadata".to_owned())
     });
     scenario.verify::<SpaceCreateResult, _>(create, |result| {
         valid_created_space(result)
@@ -470,10 +520,26 @@ fn runtime_space_lifecycle_is_red() {
             .then_some(())
             .ok_or_else(|| "space.snapshot returned the wrong space or no snapshot".to_owned())
     });
+    scenario.verify::<TableInsertResult, _>(snapshot_insert, |result| {
+        (result.row_id > 0)
+            .then_some(())
+            .ok_or_else(|| "snapshot fixture row has no auto-assigned ID".to_owned())
+    });
     scenario.verify::<RestoreResult, _>(restore, |result| {
         (result.space_id == space_id && result.restored)
             .then_some(())
             .ok_or_else(|| "space.restore did not restore the returned snapshot".to_owned())
+    });
+    scenario.verify::<TableSelectResult, _>(restored_select, |result| {
+        (result.rows.len() == 1
+            && row_matches(
+                &result.rows[0],
+                snapshot_row_id,
+                snapshot_label,
+                snapshot_rank,
+            ))
+        .then_some(())
+        .ok_or_else(|| "restored space did not retain the pre-snapshot row".to_owned())
     });
     scenario.verify::<InviteResult, _>(invite, |result| {
         (result.space_id == space_id && result.member_id > 0 && is_opaque_ref(&result.invite))
