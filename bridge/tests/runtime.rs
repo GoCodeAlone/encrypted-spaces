@@ -1207,7 +1207,7 @@ fn runtime_text_create_edit_read_round_trip() {
 }
 
 #[test]
-fn runtime_file_put_get_are_red() {
+fn runtime_file_put_get_round_trip_encrypted_bytes() {
     let actor = "actor-file-parametric";
     let bytes_base64 = "YnJpZGdlLWZpbGUtcGFyYW1ldHJpYw==";
     let mut scenario = Scenario::start("file", &[actor]);

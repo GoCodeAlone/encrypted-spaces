@@ -1,7 +1,10 @@
 use crate::protocol::Response;
 use crate::schema::{Operation, Request, PROTOCOL_VERSION};
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use encrypted_spaces_sdk::{ApplicationSchema, LocalTransport, Space, WebSocketTransport};
+use base64::{
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+    Engine,
+};
+use encrypted_spaces_sdk::{ApplicationSchema, File, LocalTransport, Space, WebSocketTransport};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -151,6 +154,20 @@ struct TextReadPayload {
     text_ref: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FilePutPayload {
+    space_id: String,
+    bytes_base64: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileGetPayload {
+    space_id: String,
+    digest: String,
+}
+
 #[derive(Serialize)]
 struct CreateResult<'a> {
     space_id: String,
@@ -238,6 +255,19 @@ struct TextReadResult {
     text: String,
 }
 
+#[derive(Serialize)]
+struct FilePutResult {
+    space_id: String,
+    digest: String,
+}
+
+#[derive(Serialize)]
+struct FileGetResult {
+    space_id: String,
+    digest: String,
+    bytes_base64: String,
+}
+
 impl Runtime {
     pub fn from_env() -> io::Result<Self> {
         let actor_id = required_env(ACTOR_ID_ENV)?;
@@ -310,6 +340,8 @@ impl Runtime {
             Operation::TextCreate => self.text_create(request.request_id, request.payload),
             Operation::TextEdit => self.text_edit(request.request_id, request.payload),
             Operation::TextRead => self.text_read(request.request_id, request.payload),
+            Operation::FilePut => self.file_put(request.request_id, request.payload),
+            Operation::FileGet => self.file_get(request.request_id, request.payload),
             operation => {
                 let _operation_name = operation.name();
                 let _ = request.payload;
@@ -702,6 +734,73 @@ impl Runtime {
         }
     }
 
+    fn file_put(&mut self, request_id: String, payload: Value) -> Response {
+        let payload = match parse_payload::<FilePutPayload>(&request_id, payload) {
+            Ok(payload) => payload,
+            Err(response) => return response,
+        };
+        let bytes = match STANDARD.decode(&payload.bytes_base64) {
+            Ok(bytes) => bytes,
+            Err(_) => return invalid_request(request_id),
+        };
+        let Some(space) = self.space.as_ref() else {
+            return invalid_state(request_id);
+        };
+        let space_id = space.id().to_string();
+        if payload.space_id != space_id {
+            return invalid_state(request_id);
+        }
+        match self
+            .executor
+            .block_on(space.file().upload(File::from_data(bytes)))
+        {
+            Ok(file) => match file.hash() {
+                Ok(digest) => Response::success(
+                    request_id,
+                    FilePutResult {
+                        space_id,
+                        digest: digest.to_owned(),
+                    },
+                ),
+                Err(_) => internal_error(request_id),
+            },
+            Err(_) => sdk_error(request_id),
+        }
+    }
+
+    fn file_get(&mut self, request_id: String, payload: Value) -> Response {
+        let payload = match parse_payload::<FileGetPayload>(&request_id, payload) {
+            Ok(payload) if valid_digest(&payload.digest) => payload,
+            Ok(_) => return invalid_request(request_id),
+            Err(response) => return response,
+        };
+        let Some(space) = self.space.as_ref() else {
+            return invalid_state(request_id);
+        };
+        let space_id = space.id().to_string();
+        if payload.space_id != space_id {
+            return invalid_state(request_id);
+        }
+        match self.executor.block_on(
+            space
+                .file()
+                .download(&File::from_hash(payload.digest.clone())),
+        ) {
+            Ok(file) => match file.into_data() {
+                Ok(bytes) => Response::success(
+                    request_id,
+                    FileGetResult {
+                        space_id,
+                        digest: payload.digest,
+                        bytes_base64: STANDARD.encode(bytes),
+                    },
+                ),
+                Err(_) => internal_error(request_id),
+            },
+            Err(_) => sdk_error(request_id),
+        }
+    }
+
     fn application_schema(&self) -> ApplicationSchema {
         ApplicationSchema::FromOwnedBytes(
             self.process.schema.clone(),
@@ -762,6 +861,10 @@ fn encode_opaque_ref(value: &impl Serialize) -> Result<String, ()> {
 fn decode_opaque_ref<T: DeserializeOwned>(value: &str) -> Result<T, ()> {
     let bytes = URL_SAFE_NO_PAD.decode(value).map_err(|_| ())?;
     serde_json::from_slice(&bytes).map_err(|_| ())
+}
+
+fn valid_digest(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn required_env(name: &str) -> io::Result<String> {
