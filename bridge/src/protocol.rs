@@ -87,6 +87,9 @@ pub fn run<R: Read, W: Write>(reader: R, mut writer: W) -> io::Result<()> {
             Err(response) => response,
         };
         write_response(&mut writer, response)?;
+        if runtime.should_shutdown() {
+            return Ok(());
+        }
     }
 }
 

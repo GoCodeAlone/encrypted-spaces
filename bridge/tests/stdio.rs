@@ -466,17 +466,26 @@ fn protocol_runtime_sdk_errors_are_deterministic_and_redacted_is_red() {
 }
 
 #[test]
-fn protocol_close_is_red() {
+fn protocol_close_clears_state_and_keeps_process_usable() {
     let mut bridge = Bridge::spawn(DEFAULT_ACTOR_ID);
     bridge.send_request("close-request", "close", json!({}));
-    assert_future_success(&bridge.receive(), "close");
+    let close = bridge.receive();
+    assert_future_success(&close, "close");
+    assert_eq!(close["result"]["closed"], true);
+
+    bridge.send_request("version-after-close", "version", json!({}));
+    assert_future_success(&bridge.receive(), "version after close");
 }
 
 #[test]
-fn protocol_shutdown_is_red() {
+fn protocol_shutdown_acknowledges_and_exits() {
     let mut bridge = Bridge::spawn(DEFAULT_ACTOR_ID);
     bridge.send_request("shutdown-request", "shutdown", json!({}));
-    assert_future_success(&bridge.receive(), "shutdown");
+    let shutdown = bridge.receive();
+    assert_future_success(&shutdown, "shutdown");
+    assert_eq!(shutdown["result"]["shutting_down"], true);
+    assert!(bridge.wait_for_exit().success());
+    bridge.expect_stdout_eof();
 }
 
 #[test]

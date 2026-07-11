@@ -22,6 +22,7 @@ pub struct Runtime {
     executor: tokio::runtime::Runtime,
     process: ProcessConfig,
     space: Option<Space>,
+    shutdown_requested: bool,
 }
 
 struct ProcessConfig {
@@ -310,6 +311,16 @@ struct RemoveResult {
     removed: bool,
 }
 
+#[derive(Serialize)]
+struct CloseResult {
+    closed: bool,
+}
+
+#[derive(Serialize)]
+struct ShutdownResult {
+    shutting_down: bool,
+}
+
 impl Runtime {
     pub fn from_env() -> io::Result<Self> {
         let actor_id = required_env(ACTOR_ID_ENV)?;
@@ -347,6 +358,7 @@ impl Runtime {
                 backend_url,
             },
             space: None,
+            shutdown_requested: false,
         })
     }
 
@@ -389,6 +401,8 @@ impl Runtime {
                 self.member_join(request.request_id, request.payload)
             }
             Operation::MemberRemove => self.member_remove(request.request_id, request.payload),
+            Operation::Close => self.close(request.request_id, request.payload),
+            Operation::Shutdown => self.shutdown(request.request_id, request.payload),
             operation => {
                 let _operation_name = operation.name();
                 let _ = request.payload;
@@ -941,6 +955,32 @@ impl Runtime {
             ),
             Err(error) => sdk_operation_error(request_id, &error),
         }
+    }
+
+    fn close(&mut self, request_id: String, payload: Value) -> Response {
+        if let Err(response) = parse_payload::<EmptyPayload>(&request_id, payload) {
+            return response;
+        }
+        self.space.take();
+        Response::success(request_id, CloseResult { closed: true })
+    }
+
+    fn shutdown(&mut self, request_id: String, payload: Value) -> Response {
+        if let Err(response) = parse_payload::<EmptyPayload>(&request_id, payload) {
+            return response;
+        }
+        self.space.take();
+        self.shutdown_requested = true;
+        Response::success(
+            request_id,
+            ShutdownResult {
+                shutting_down: true,
+            },
+        )
+    }
+
+    pub fn should_shutdown(&self) -> bool {
+        self.shutdown_requested
     }
 
     fn application_schema(&self) -> ApplicationSchema {
