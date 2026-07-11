@@ -4,7 +4,7 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 const PROTOCOL_VERSION: u64 = 1;
@@ -17,12 +17,21 @@ struct BridgeProcess {
     stdout: BufReader<ChildStdout>,
     scenario: String,
     next_request: usize,
+    schema_path: PathBuf,
 }
 
 impl BridgeProcess {
     fn spawn(scenario: &str, actor: &str) -> Self {
+        let schema_path = std::env::temp_dir().join(format!(
+            "encrypted-spaces-bridge-{}-{}-{}.kdl",
+            std::process::id(),
+            scenario,
+            actor
+        ));
+        fs::write(&schema_path, SCHEMA_KDL).expect("write bridge schema fixture");
         let mut child = Command::new(env!("CARGO_BIN_EXE_encrypted-spaces-bridge"))
             .env("ENCRYPTED_SPACES_ACTOR_ID", actor)
+            .env("ENCRYPTED_SPACES_SCHEMA_PATH", &schema_path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
@@ -35,6 +44,7 @@ impl BridgeProcess {
             stdout,
             scenario: format!("{scenario}-{actor}"),
             next_request: 1,
+            schema_path,
         }
     }
 
@@ -97,6 +107,7 @@ impl BridgeProcess {
     fn finish(mut self) {
         drop(self.stdin.take());
         let status = self.child.wait().expect("wait for bridge");
+        fs::remove_file(&self.schema_path).expect("remove bridge schema fixture");
         assert!(status.success(), "bridge exited with {status}");
     }
 }
@@ -215,7 +226,7 @@ struct HelloResult {
 #[derive(Deserialize)]
 struct SpaceCreateResult {
     space_id: String,
-    schema: Value,
+    schema_sha256: String,
 }
 
 #[derive(Deserialize)]
@@ -233,71 +244,90 @@ struct RestoreResult {
 #[derive(Deserialize)]
 struct InviteResult {
     space_id: String,
-    member_id: String,
+    member_id: i64,
     invite: Value,
 }
 
 #[derive(Deserialize)]
 struct JoinResult {
     space_id: String,
-    member_id: String,
+    member_id: i64,
     joined: bool,
 }
 
 #[derive(Deserialize)]
 struct SyncResult {
     space_id: String,
-    change_id: u64,
+    synced: bool,
 }
 
 #[derive(Deserialize)]
 struct RemoveResult {
     space_id: String,
-    member_id: String,
+    member_id: i64,
     removed: bool,
 }
 
 #[derive(Deserialize)]
 struct TableInsertResult {
-    space_id: String,
-    table: String,
-    row_id: Value,
-    row: Value,
+    row_id: i64,
 }
 
 #[derive(Deserialize)]
 struct TableSelectResult {
-    space_id: String,
-    table: String,
     rows: Vec<Value>,
 }
 
 #[derive(Deserialize)]
 struct ListCreateResult {
     space_id: String,
-    list_id: String,
-    name: String,
+    table: String,
+    row_id: i64,
+    column: String,
+    list_ref: Value,
 }
 
 #[derive(Deserialize)]
 struct ListAppendResult {
     space_id: String,
-    list_id: String,
-    index: usize,
+    list_ref: Value,
+    item_ref: Value,
+}
+
+#[derive(Deserialize)]
+struct ListItemResult {
+    item_ref: Value,
+    position: u64,
     value: Value,
 }
 
 #[derive(Deserialize)]
 struct ListReadResult {
     space_id: String,
-    list_id: String,
-    items: Vec<Value>,
+    list_ref: Value,
+    items: Vec<ListItemResult>,
 }
 
 #[derive(Deserialize)]
-struct TextResult {
+struct TextCreateResult {
     space_id: String,
-    text_id: String,
+    table: String,
+    row_id: i64,
+    column: String,
+    text_ref: Value,
+}
+
+#[derive(Deserialize)]
+struct TextEditResult {
+    space_id: String,
+    text_ref: Value,
+    edited: bool,
+}
+
+#[derive(Deserialize)]
+struct TextReadResult {
+    space_id: String,
+    text_ref: Value,
     text: String,
 }
 
@@ -314,20 +344,68 @@ struct FileGetResult {
     bytes_base64: String,
 }
 
-fn concrete_schema(name: &str) -> Value {
+const TABLE: &str = "bridge_records";
+const LIST_COLUMN: &str = "items";
+const TEXT_COLUMN: &str = "document";
+const FILE_DIGEST_PLACEHOLDER: &str =
+    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+const SCHEMA_KDL: &str = r#"
+table "bridge_records" auto_increment=#true {
+    column "id"         type="int"     plaintext=#true
+    column "rank"       type="int"
+    column "label"      type="text"
+    column "items"      type="list"
+    column "document"   type="list"
+    column "attachment" type="fileref"
+}
+"#;
+fn create_payload() -> Value {
+    json!({})
+}
+
+fn join_payload(invite: Value) -> Value {
+    json!({"invite": invite})
+}
+
+fn parent_row(label: &str, rank: i64) -> Value {
     json!({
-        "tables": [{
-            "name": name,
-            "columns": [
-                {"name": "id", "type": "integer", "primary_key": true},
-                {"name": "label", "type": "text", "nullable": false}
-            ]
-        }]
+        "rank": rank,
+        "label": label,
+        "items": 0,
+        "document": 0,
+        "attachment": FILE_DIGEST_PLACEHOLDER,
     })
+}
+
+fn valid_space_id(space_id: &str) -> bool {
+    space_id.len() == 32 && space_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn valid_created_space(result: &SpaceCreateResult) -> bool {
+    valid_space_id(&result.space_id) && valid_digest(&result.schema_sha256)
 }
 
 fn valid_digest(digest: &str) -> bool {
     digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn is_opaque_ref(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::String(value) => !value.is_empty(),
+        Value::Array(value) => !value.is_empty(),
+        Value::Object(value) => !value.is_empty(),
+        Value::Bool(_) | Value::Number(_) => true,
+    }
+}
+
+fn row_matches(row: &Value, row_id: i64, label: &str, rank: i64) -> bool {
+    row["id"].as_i64() == Some(row_id)
+        && row["rank"].as_i64() == Some(rank)
+        && row["label"].as_str() == Some(label)
+        && !row["items"].is_null()
+        && !row["document"].is_null()
+        && row["attachment"].as_str() == Some(FILE_DIGEST_PLACEHOLDER)
 }
 
 #[test]
@@ -351,11 +429,10 @@ fn runtime_request_actor_override_is_rejected() {
 fn runtime_space_lifecycle_is_red() {
     let owner = "owner-lifecycle-parametric";
     let member = "member-lifecycle-parametric";
-    let schema = concrete_schema("lifecycle_records");
     let mut scenario = Scenario::start("lifecycle", &[owner, member]);
 
     let hello = scenario.request(owner, "hello", json!({}));
-    let create = scenario.request(owner, "space.create", json!({"schema": schema}));
+    let create = scenario.request(owner, "space.create", create_payload());
     let space_id = scenario.returned_string(create, "space_id", "missing-lifecycle-space");
     let snapshot = scenario.request(owner, "space.snapshot", json!({"space_id": space_id}));
     let snapshot_value = scenario.returned_value(
@@ -363,28 +440,19 @@ fn runtime_space_lifecycle_is_red() {
         "snapshot",
         json!({"missing": "lifecycle-snapshot"}),
     );
-    let restore = scenario.request(
-        owner,
-        "space.restore",
-        json!({"space_id": space_id, "snapshot": snapshot_value}),
-    );
-    let invite = scenario.request(
-        owner,
-        "member.invite",
-        json!({"space_id": space_id, "member_id": member}),
-    );
+    let restore = scenario.request(owner, "space.restore", json!({"snapshot": snapshot_value}));
+    let invite = scenario.request(owner, "member.invite", json!({"space_id": space_id}));
+    let member_id = scenario.observations[invite].response["result"]["member_id"]
+        .as_i64()
+        .unwrap_or(-1);
     let invite_value =
         scenario.returned_value(invite, "invite", json!({"missing": "lifecycle-invite"}));
-    let join = scenario.request(
-        member,
-        "space.join",
-        json!({"space_id": space_id, "invite": invite_value}),
-    );
+    let join = scenario.request(member, "space.join", join_payload(invite_value));
     let sync = scenario.request(member, "space.sync", json!({"space_id": space_id}));
     let remove = scenario.request(
         owner,
         "member.remove",
-        json!({"space_id": space_id, "member_id": member}),
+        json!({"space_id": space_id, "member_id": member_id}),
     );
 
     scenario.verify::<HelloResult, _>(hello, |result| {
@@ -393,9 +461,9 @@ fn runtime_space_lifecycle_is_red() {
             .ok_or_else(|| "hello returned the wrong protocol version".to_owned())
     });
     scenario.verify::<SpaceCreateResult, _>(create, |result| {
-        (!result.space_id.is_empty() && result.schema == schema)
+        valid_created_space(result)
             .then_some(())
-            .ok_or_else(|| "space.create did not return its concrete schema".to_owned())
+            .ok_or_else(|| "space.create returned an invalid SpaceId".to_owned())
     });
     scenario.verify::<SnapshotResult, _>(snapshot, |result| {
         (result.space_id == space_id && !result.snapshot.is_null())
@@ -408,22 +476,22 @@ fn runtime_space_lifecycle_is_red() {
             .ok_or_else(|| "space.restore did not restore the returned snapshot".to_owned())
     });
     scenario.verify::<InviteResult, _>(invite, |result| {
-        (result.space_id == space_id && result.member_id == member && !result.invite.is_null())
+        (result.space_id == space_id && result.member_id > 0 && is_opaque_ref(&result.invite))
             .then_some(())
-            .ok_or_else(|| "member.invite returned an invalid invite".to_owned())
+            .ok_or_else(|| "member.invite returned no numeric member ID or invite".to_owned())
     });
     scenario.verify::<JoinResult, _>(join, |result| {
-        (result.space_id == space_id && result.member_id == member && result.joined)
+        (result.space_id == space_id && result.member_id == member_id && result.joined)
             .then_some(())
             .ok_or_else(|| "space.join did not consume the returned invite".to_owned())
     });
     scenario.verify::<SyncResult, _>(sync, |result| {
-        (result.space_id == space_id && result.change_id > 0)
+        (result.space_id == space_id && result.synced)
             .then_some(())
-            .ok_or_else(|| "space.sync returned no applied change".to_owned())
+            .ok_or_else(|| "space.sync did not report a completed sync".to_owned())
     });
     scenario.verify::<RemoveResult, _>(remove, |result| {
-        (result.space_id == space_id && result.member_id == member && result.removed)
+        (result.space_id == space_id && result.member_id == member_id && result.removed)
             .then_some(())
             .ok_or_else(|| "member.remove did not remove the joined member".to_owned())
     });
@@ -433,42 +501,40 @@ fn runtime_space_lifecycle_is_red() {
 #[test]
 fn runtime_table_insert_select_are_red() {
     let actor = "actor-table-parametric";
-    let schema = concrete_schema("records_parametric");
-    let row = json!({"id": 41, "label": "table-value-parametric"});
+    let label = "table-value-parametric";
+    let rank = 41;
+    let row = parent_row(label, rank);
     let mut scenario = Scenario::start("table", &[actor]);
-    let create = scenario.request(actor, "space.create", json!({"schema": schema}));
+    let create = scenario.request(actor, "space.create", create_payload());
     let space_id = scenario.returned_string(create, "space_id", "missing-table-space");
     let insert = scenario.request(
         actor,
         "table.insert",
-        json!({"space_id": space_id, "table": "records_parametric", "row": row}),
+        json!({"space_id": space_id, "table": TABLE, "row": row}),
     );
-    let row_id = scenario.returned_value(insert, "row_id", json!(41));
+    let row_id = scenario.observations[insert].response["result"]["row_id"]
+        .as_i64()
+        .unwrap_or(-1);
     let select = scenario.request(
         actor,
         "table.select",
-        json!({"space_id": space_id, "table": "records_parametric", "where": {"id": row_id}}),
+        json!({"space_id": space_id, "table": TABLE, "where": {"id": row_id}}),
     );
 
     scenario.verify::<SpaceCreateResult, _>(create, |result| {
-        (!result.space_id.is_empty() && result.schema == schema)
+        valid_created_space(result)
             .then_some(())
-            .ok_or_else(|| "space.create did not return the table schema".to_owned())
+            .ok_or_else(|| "space.create returned an invalid SpaceId".to_owned())
     });
     scenario.verify::<TableInsertResult, _>(insert, |result| {
-        (result.space_id == space_id
-            && result.table == "records_parametric"
-            && result.row_id == json!(41)
-            && result.row == row)
+        (result.row_id > 0)
             .then_some(())
-            .ok_or_else(|| "table.insert returned the wrong typed row".to_owned())
+            .ok_or_else(|| "table.insert returned no auto-assigned row ID".to_owned())
     });
     scenario.verify::<TableSelectResult, _>(select, |result| {
-        (result.space_id == space_id
-            && result.table == "records_parametric"
-            && result.rows == vec![row])
-        .then_some(())
-        .ok_or_else(|| "table.select did not return the inserted row".to_owned())
+        (result.rows.len() == 1 && row_matches(&result.rows[0], row_id, label, rank))
+            .then_some(())
+            .ok_or_else(|| "table.select did not return the auto-ID row content".to_owned())
     });
     scenario.finish();
 }
@@ -476,50 +542,79 @@ fn runtime_table_insert_select_are_red() {
 #[test]
 fn runtime_list_create_append_read_are_red() {
     let actor = "actor-list-parametric";
-    let schema = concrete_schema("list_records_parametric");
+    let label = "list-parent-parametric";
+    let rank = 73;
     let item = json!({"key": "list-key-parametric", "value": 73});
     let mut scenario = Scenario::start("list", &[actor]);
-    let create_space = scenario.request(actor, "space.create", json!({"schema": schema}));
+    let create_space = scenario.request(actor, "space.create", create_payload());
     let space_id = scenario.returned_string(create_space, "space_id", "missing-list-space");
+    let insert = scenario.request(
+        actor,
+        "table.insert",
+        json!({"space_id": space_id, "table": TABLE, "row": parent_row(label, rank)}),
+    );
+    let row_id = scenario.observations[insert].response["result"]["row_id"]
+        .as_i64()
+        .unwrap_or(-1);
     let create = scenario.request(
         actor,
         "list.create",
-        json!({"space_id": space_id, "name": "queue_parametric"}),
+        json!({"space_id": space_id, "table": TABLE, "row_id": row_id, "column": LIST_COLUMN}),
     );
-    let list_id = scenario.returned_string(create, "list_id", "missing-list-id");
+    let list_ref = scenario.returned_value(
+        create,
+        "list_ref",
+        json!({"missing": "list-handle-reference"}),
+    );
     let append = scenario.request(
         actor,
         "list.append",
-        json!({"space_id": space_id, "list_id": list_id, "value": item}),
+        json!({"space_id": space_id, "list_ref": list_ref, "value": item}),
+    );
+    let item_ref = scenario.returned_value(
+        append,
+        "item_ref",
+        json!({"missing": "list-item-reference"}),
     );
     let read = scenario.request(
         actor,
         "list.read",
-        json!({"space_id": space_id, "list_id": list_id}),
+        json!({"space_id": space_id, "list_ref": list_ref}),
     );
 
     scenario.verify::<SpaceCreateResult, _>(create_space, |result| {
-        (!result.space_id.is_empty() && result.schema == schema)
+        valid_created_space(result)
             .then_some(())
-            .ok_or_else(|| "space.create did not return the list schema".to_owned())
+            .ok_or_else(|| "space.create returned an invalid SpaceId".to_owned())
+    });
+    scenario.verify::<TableInsertResult, _>(insert, |result| {
+        (result.row_id > 0)
+            .then_some(())
+            .ok_or_else(|| "list parent row has no auto-assigned ID".to_owned())
     });
     scenario.verify::<ListCreateResult, _>(create, |result| {
         (result.space_id == space_id
-            && !result.list_id.is_empty()
-            && result.name == "queue_parametric")
-            .then_some(())
-            .ok_or_else(|| "list.create returned the wrong list".to_owned())
+            && result.table == TABLE
+            && result.row_id == row_id
+            && result.column == LIST_COLUMN
+            && is_opaque_ref(&result.list_ref))
+        .then_some(())
+        .ok_or_else(|| "list.create returned no scoped Space list handle".to_owned())
     });
     scenario.verify::<ListAppendResult, _>(append, |result| {
         (result.space_id == space_id
-            && result.list_id == list_id
-            && result.index == 0
-            && result.value == item)
-            .then_some(())
-            .ok_or_else(|| "list.append returned the wrong item".to_owned())
+            && result.list_ref == list_ref
+            && is_opaque_ref(&result.item_ref))
+        .then_some(())
+        .ok_or_else(|| "list.append returned no SDK list item reference".to_owned())
     });
     scenario.verify::<ListReadResult, _>(read, |result| {
-        (result.space_id == space_id && result.list_id == list_id && result.items == vec![item])
+        (result.space_id == space_id
+            && result.list_ref == list_ref
+            && result.items.len() == 1
+            && result.items[0].item_ref == item_ref
+            && result.items[0].position == 0
+            && result.items[0].value == item)
             .then_some(())
             .ok_or_else(|| "list.read did not return the appended item".to_owned())
     });
@@ -529,48 +624,73 @@ fn runtime_list_create_append_read_are_red() {
 #[test]
 fn runtime_text_create_edit_read_are_red() {
     let actor = "actor-text-parametric";
-    let schema = concrete_schema("text_records_parametric");
-    let initial = "initial text parametric";
     let edited = "edited text parametric";
     let mut scenario = Scenario::start("text", &[actor]);
-    let create_space = scenario.request(actor, "space.create", json!({"schema": schema}));
+    let create_space = scenario.request(actor, "space.create", create_payload());
     let space_id = scenario.returned_string(create_space, "space_id", "missing-text-space");
+    let insert = scenario.request(
+        actor,
+        "table.insert",
+        json!({"space_id": space_id, "table": TABLE, "row": parent_row("text-parent-parametric", 89)}),
+    );
+    let row_id = scenario.observations[insert].response["result"]["row_id"]
+        .as_i64()
+        .unwrap_or(-1);
     let create = scenario.request(
         actor,
         "text.create",
-        json!({"space_id": space_id, "name": "document_parametric", "text": initial}),
+        json!({"space_id": space_id, "table": TABLE, "row_id": row_id, "column": TEXT_COLUMN}),
     );
-    let text_id = scenario.returned_string(create, "text_id", "missing-text-id");
+    let text_ref = scenario.returned_value(
+        create,
+        "text_ref",
+        json!({"missing": "text-handle-reference"}),
+    );
     let edit = scenario.request(
         actor,
         "text.edit",
-        json!({"space_id": space_id, "text_id": text_id, "text": edited}),
+        json!({
+            "space_id": space_id,
+            "text_ref": text_ref,
+            "position": 0,
+            "delete_count": 0,
+            "insert": edited,
+        }),
     );
     let read = scenario.request(
         actor,
         "text.read",
-        json!({"space_id": space_id, "text_id": text_id}),
+        json!({"space_id": space_id, "text_ref": text_ref}),
     );
 
     scenario.verify::<SpaceCreateResult, _>(create_space, |result| {
-        (!result.space_id.is_empty() && result.schema == schema)
+        valid_created_space(result)
             .then_some(())
-            .ok_or_else(|| "space.create did not return the text schema".to_owned())
+            .ok_or_else(|| "space.create returned an invalid SpaceId".to_owned())
     });
-    scenario.verify::<TextResult, _>(create, |result| {
-        (result.space_id == space_id && !result.text_id.is_empty() && result.text == initial)
+    scenario.verify::<TableInsertResult, _>(insert, |result| {
+        (result.row_id > 0)
             .then_some(())
-            .ok_or_else(|| "text.create returned the wrong document".to_owned())
+            .ok_or_else(|| "text parent row has no auto-assigned ID".to_owned())
     });
-    scenario.verify::<TextResult, _>(edit, |result| {
-        (result.space_id == space_id && result.text_id == text_id && result.text == edited)
-            .then_some(())
-            .ok_or_else(|| "text.edit returned the wrong document".to_owned())
+    scenario.verify::<TextCreateResult, _>(create, |result| {
+        (result.space_id == space_id
+            && result.table == TABLE
+            && result.row_id == row_id
+            && result.column == TEXT_COLUMN
+            && is_opaque_ref(&result.text_ref))
+        .then_some(())
+        .ok_or_else(|| "text.create returned no scoped Space textarea handle".to_owned())
     });
-    scenario.verify::<TextResult, _>(read, |result| {
-        (result.space_id == space_id && result.text_id == text_id && result.text == edited)
+    scenario.verify::<TextEditResult, _>(edit, |result| {
+        (result.space_id == space_id && result.text_ref == text_ref && result.edited)
             .then_some(())
-            .ok_or_else(|| "text.read did not return the edited document".to_owned())
+            .ok_or_else(|| "text.edit did not apply the positional edit".to_owned())
+    });
+    scenario.verify::<TextReadResult, _>(read, |result| {
+        (result.space_id == space_id && result.text_ref == text_ref && result.text == edited)
+            .then_some(())
+            .ok_or_else(|| "text.read did not return the edited textarea".to_owned())
     });
     scenario.finish();
 }
@@ -578,10 +698,9 @@ fn runtime_text_create_edit_read_are_red() {
 #[test]
 fn runtime_file_put_get_are_red() {
     let actor = "actor-file-parametric";
-    let schema = concrete_schema("file_records_parametric");
     let bytes_base64 = "YnJpZGdlLWZpbGUtcGFyYW1ldHJpYw==";
     let mut scenario = Scenario::start("file", &[actor]);
-    let create_space = scenario.request(actor, "space.create", json!({"schema": schema}));
+    let create_space = scenario.request(actor, "space.create", create_payload());
     let space_id = scenario.returned_string(create_space, "space_id", "missing-file-space");
     let put = scenario.request(
         actor,
@@ -596,9 +715,9 @@ fn runtime_file_put_get_are_red() {
     );
 
     scenario.verify::<SpaceCreateResult, _>(create_space, |result| {
-        (!result.space_id.is_empty() && result.schema == schema)
+        valid_created_space(result)
             .then_some(())
-            .ok_or_else(|| "space.create did not return the file schema".to_owned())
+            .ok_or_else(|| "space.create returned an invalid SpaceId".to_owned())
     });
     scenario.verify::<FilePutResult, _>(put, |result| {
         (result.space_id == space_id && valid_digest(&result.digest))
@@ -616,48 +735,42 @@ fn runtime_file_put_get_are_red() {
 }
 
 #[test]
-fn runtime_member_invite_join_remove_are_red() {
+fn runtime_member_invite_space_join_remove_are_red() {
     let owner = "owner-membership-parametric";
     let member = "member-membership-parametric";
-    let schema = concrete_schema("membership_records_parametric");
     let mut scenario = Scenario::start("membership", &[owner, member]);
-    let create_space = scenario.request(owner, "space.create", json!({"schema": schema}));
+    let create_space = scenario.request(owner, "space.create", create_payload());
     let space_id = scenario.returned_string(create_space, "space_id", "missing-member-space");
-    let invite = scenario.request(
-        owner,
-        "member.invite",
-        json!({"space_id": space_id, "member_id": member}),
-    );
+    let invite = scenario.request(owner, "member.invite", json!({"space_id": space_id}));
+    let member_id = scenario.observations[invite].response["result"]["member_id"]
+        .as_i64()
+        .unwrap_or(-1);
     let invite_value =
         scenario.returned_value(invite, "invite", json!({"missing": "membership-invite"}));
-    let join = scenario.request(
-        member,
-        "member.join",
-        json!({"space_id": space_id, "invite": invite_value}),
-    );
+    let join = scenario.request(member, "space.join", join_payload(invite_value));
     let remove = scenario.request(
         owner,
         "member.remove",
-        json!({"space_id": space_id, "member_id": member}),
+        json!({"space_id": space_id, "member_id": member_id}),
     );
 
     scenario.verify::<SpaceCreateResult, _>(create_space, |result| {
-        (!result.space_id.is_empty() && result.schema == schema)
+        valid_created_space(result)
             .then_some(())
-            .ok_or_else(|| "space.create did not return the membership schema".to_owned())
+            .ok_or_else(|| "space.create returned an invalid SpaceId".to_owned())
     });
     scenario.verify::<InviteResult, _>(invite, |result| {
-        (result.space_id == space_id && result.member_id == member && !result.invite.is_null())
+        (result.space_id == space_id && result.member_id > 0 && is_opaque_ref(&result.invite))
             .then_some(())
-            .ok_or_else(|| "member.invite returned the wrong member invite".to_owned())
+            .ok_or_else(|| "member.invite returned no numeric member ID or invite".to_owned())
     });
     scenario.verify::<JoinResult, _>(join, |result| {
-        (result.space_id == space_id && result.member_id == member && result.joined)
+        (result.space_id == space_id && result.member_id == member_id && result.joined)
             .then_some(())
-            .ok_or_else(|| "member.join did not join the invited member".to_owned())
+            .ok_or_else(|| "space.join did not join the invited SDK member".to_owned())
     });
     scenario.verify::<RemoveResult, _>(remove, |result| {
-        (result.space_id == space_id && result.member_id == member && result.removed)
+        (result.space_id == space_id && result.member_id == member_id && result.removed)
             .then_some(())
             .ok_or_else(|| "member.remove did not remove the joined member".to_owned())
     });
