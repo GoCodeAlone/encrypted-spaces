@@ -9,6 +9,7 @@ permissions:
 
 env:
   RELEASE_READY: false
+  RELEASE_VERSION: 0.1.0
   UPSTREAM_COMMIT: 4cda0ae87698135aa672990e6e68cf7873847426
   RUST_VERSION: 1.94.1
   RISC0_SKIP_BUILD: 1
@@ -53,34 +54,50 @@ jobs:
       matrix:
         include:
           - component: backend
+            package: encrypted-spaces-backend-server
+            binary: encrypted-spaces-backend-server
             os: ubuntu-24.04
             target: linux-amd64
             archive: encrypted-spaces-backend-linux-amd64.tar.gz
           - component: backend
+            package: encrypted-spaces-backend-server
+            binary: encrypted-spaces-backend-server
             os: ubuntu-24.04
             target: linux-arm64
             archive: encrypted-spaces-backend-linux-arm64.tar.gz
           - component: backend
+            package: encrypted-spaces-backend-server
+            binary: encrypted-spaces-backend-server
             os: macos-15-intel
             target: macos-amd64
             archive: encrypted-spaces-backend-macos-amd64.tar.gz
           - component: backend
+            package: encrypted-spaces-backend-server
+            binary: encrypted-spaces-backend-server
             os: macos-14
             target: macos-arm64
             archive: encrypted-spaces-backend-macos-arm64.tar.gz
           - component: bridge
+            package: encrypted-spaces-bridge
+            binary: encrypted-spaces-bridge
             os: ubuntu-24.04
             target: linux-amd64
             archive: encrypted-spaces-bridge-linux-amd64.tar.gz
           - component: bridge
+            package: encrypted-spaces-bridge
+            binary: encrypted-spaces-bridge
             os: ubuntu-24.04
             target: linux-arm64
             archive: encrypted-spaces-bridge-linux-arm64.tar.gz
           - component: bridge
+            package: encrypted-spaces-bridge
+            binary: encrypted-spaces-bridge
             os: macos-15-intel
             target: macos-amd64
             archive: encrypted-spaces-bridge-macos-amd64.tar.gz
           - component: bridge
+            package: encrypted-spaces-bridge
+            binary: encrypted-spaces-bridge
             os: macos-14
             target: macos-arm64
             archive: encrypted-spaces-bridge-macos-arm64.tar.gz
@@ -88,6 +105,20 @@ jobs:
     steps:
       - name: Checkout pinned source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Build and test with the pinned toolchain
+        shell: bash
+        env:
+          PACKAGE: ${{ matrix.package }}
+          BINARY: ${{ matrix.binary }}
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup run "$RUST_VERSION" cargo test --locked -p "$PACKAGE" --no-run
+          rustup run "$RUST_VERSION" cargo build --locked --release -p "$PACKAGE"
+          built="$GITHUB_WORKSPACE/target/release/$BINARY"
+          test -x "$built"
+          echo "BUILT_BINARY=$built" >> "$GITHUB_ENV"
 
       - name: Verify release asset
         shell: bash
@@ -107,6 +138,38 @@ jobs:
           test -s "$checksum"
           test -s "$provenance"
 
+          extract="$(mktemp -d)"
+          trap 'rm -rf "$extract"' EXIT
+          tar -xzf "$archive" -C "$extract"
+          packaged="$(find "$extract" -type f -name "encrypted-spaces-$COMPONENT" -print -quit)"
+          test -n "$packaged"
+          test -x "$packaged"
+          cmp "$BUILT_BINARY" "$packaged"
+
+          description="$(file -b "$packaged")"
+          case "$TARGET" in
+            linux-amd64)  grep -Eq 'ELF 64-bit.*(x86-64|x86_64)' <<< "$description" ;;
+            linux-arm64)  grep -Eq 'ELF 64-bit.*(ARM aarch64|aarch64)' <<< "$description" ;;
+            macos-amd64)  grep -Eq 'Mach-O 64-bit.*x86_64' <<< "$description" ;;
+            macos-arm64)  grep -Eq 'Mach-O 64-bit.*arm64' <<< "$description" ;;
+            *) echo "unsupported release target: $TARGET" >&2; exit 1 ;;
+          esac
+          python3 - "$packaged" "$RELEASE_VERSION" <<'PY'
+          import subprocess
+          import sys
+
+          result = subprocess.run(
+              [sys.argv[1], "--version"],
+              check=True,
+              capture_output=True,
+              text=True,
+              timeout=5,
+          )
+          output = result.stdout + result.stderr
+          if sys.argv[2] not in output:
+              raise SystemExit(f"version output does not contain {sys.argv[2]}: {output!r}")
+          PY
+
           jq -e \
             --arg component "$COMPONENT" \
             --arg target "$TARGET" \
@@ -115,12 +178,15 @@ jobs:
             --arg toolchain "$RUST_VERSION" '
               .upstream_commit == $upstream and
               .rust_toolchain == $toolchain and
+              .version == env.RELEASE_VERSION and
               (.artifacts | length == 8) and
               ([.artifacts[].archive] | unique | length == 8) and
               ([.artifacts[] | select(
                 .component == $component and
                 .target == $target and
                 .archive == $archive and
+                .binary == ("encrypted-spaces-" + $component) and
+                .version == env.RELEASE_VERSION and
                 (.sha256 | test("^[0-9a-f]{64}$"))
               )] | length == 1)
             ' "$manifest"
