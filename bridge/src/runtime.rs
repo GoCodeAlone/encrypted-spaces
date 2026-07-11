@@ -59,6 +59,14 @@ struct RestorePayload {
     snapshot: Value,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SyncPayload {
+    space_id: String,
+    #[serde(default)]
+    wait_for_change_ms: Option<u64>,
+}
+
 #[derive(Serialize)]
 struct CreateResult<'a> {
     space_id: String,
@@ -75,6 +83,12 @@ struct SnapshotResult {
 struct RestoreResult {
     space_id: String,
     restored: bool,
+}
+
+#[derive(Serialize)]
+struct SyncResult {
+    space_id: String,
+    synced: bool,
 }
 
 impl Runtime {
@@ -140,6 +154,7 @@ impl Runtime {
             Operation::Create => self.create(request.request_id, request.payload),
             Operation::Snapshot => self.snapshot(request.request_id, request.payload),
             Operation::Restore => self.restore(request.request_id, request.payload),
+            Operation::Sync => self.sync(request.request_id, request.payload),
             operation => {
                 let _operation_name = operation.name();
                 let _ = request.payload;
@@ -218,6 +233,33 @@ impl Runtime {
                 restored: true,
             },
         )
+    }
+
+    fn sync(&mut self, request_id: String, payload: Value) -> Response {
+        let payload = match parse_payload::<SyncPayload>(&request_id, payload) {
+            Ok(payload) => payload,
+            Err(response) => return response,
+        };
+        if payload.wait_for_change_ms.is_some() {
+            return Response::not_implemented(request_id);
+        }
+        let Some(space) = self.space.as_ref() else {
+            return invalid_state(request_id);
+        };
+        let space_id = space.id().to_string();
+        if payload.space_id != space_id {
+            return invalid_state(request_id);
+        }
+        match self.executor.block_on(space.sync()) {
+            Ok(()) => Response::success(
+                request_id,
+                SyncResult {
+                    space_id,
+                    synced: true,
+                },
+            ),
+            Err(_) => sdk_error(request_id),
+        }
     }
 
     fn application_schema(&self) -> ApplicationSchema {

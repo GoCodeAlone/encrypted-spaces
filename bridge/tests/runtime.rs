@@ -833,6 +833,23 @@ fn runtime_create_restore_uses_backend_and_survives_process_restart() {
 }
 
 #[test]
+fn runtime_snapshot_sync_runs_verified_backend_recovery() {
+    let actor = "actor-snapshot-sync-parametric";
+    let mut scenario = Scenario::start("snapshot-sync", &[actor]);
+
+    let create = scenario.request(actor, "space.create", json!({}));
+    let space_id = scenario.returned_string(create, "space_id", "missing-sync-space");
+    let sync = scenario.request(actor, "space.sync", json!({"space_id": space_id}));
+
+    scenario.verify::<SyncResult, _>(sync, |result| {
+        (result.space_id == space_id && result.synced)
+            .then_some(())
+            .ok_or_else(|| "space.sync did not complete verified recovery".to_owned())
+    });
+    scenario.finish();
+}
+
+#[test]
 fn runtime_space_lifecycle_is_red() {
     let owner = "owner-lifecycle-parametric";
     let member = "member-lifecycle-parametric";
