@@ -190,4 +190,20 @@ mod tests {
             b"{\"version\":1,\"request_id\":\"encode-request\",\"ok\":false,\"error\":{\"code\":\"INVALID_REQUEST\",\"message\":\"invalid bridge request\"}}\n"
         );
     }
+
+    #[test]
+    fn protocol_frame_limit_accepts_exact_and_rejects_oversize() {
+        let mut exact = io::Cursor::new(vec![b'x'; MAX_FRAME_BYTES]);
+        let frame = match read_frame(&mut exact) {
+            Ok(Some(frame)) => frame,
+            _ => panic!("exact-size frame must be accepted"),
+        };
+        assert_eq!(frame.len(), MAX_FRAME_BYTES);
+
+        let mut oversize = io::Cursor::new(vec![b'x'; MAX_FRAME_BYTES + 1]);
+        assert!(matches!(
+            read_frame(&mut oversize),
+            Err(FrameError::TooLarge)
+        ));
+    }
 }
