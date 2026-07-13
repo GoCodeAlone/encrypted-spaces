@@ -1,3 +1,5 @@
+#![cfg_attr(not(test), deny(clippy::print_stdout))]
+
 pub mod action;
 pub mod authentication;
 mod broadcast;

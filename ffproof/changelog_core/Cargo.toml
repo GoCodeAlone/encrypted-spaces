@@ -10,6 +10,7 @@ postcard = { workspace = true }
 encrypted-spaces-acl-types = { workspace = true }
 hex.workspace = true
 instant.workspace = true
+log.workspace = true
 risc0-zkvm = { workspace = true, features = ["std"] }
 thiserror = { workspace = true }
 rand = { workspace = true, features = ["os_rng"] }

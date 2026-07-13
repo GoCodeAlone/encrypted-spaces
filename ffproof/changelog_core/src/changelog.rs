@@ -14,6 +14,15 @@ pub type HashedValues = BTreeMap<[u8; 32], Vec<u8>>;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+macro_rules! verification_diagnostic {
+    ($($arg:tt)*) => {{
+        #[cfg(target_os = "zkvm")]
+        risc0_zkvm::guest::env::log(&format!($($arg)*));
+        #[cfg(not(target_os = "zkvm"))]
+        log::debug!($($arg)*);
+    }};
+}
+
 ///// Changelog Structures
 
 #[cfg(test)]
@@ -1289,7 +1298,7 @@ pub fn validate_parent_clc(
     match recent_roots.iter().find(|(cid, _)| *cid == parent_change) {
         Some((_, root)) => {
             if root != parent_clc {
-                println!(
+                verification_diagnostic!(
                     "parent_clc mismatch: parent_change={parent_change}, claimed={}, expected={}",
                     hex::encode(parent_clc),
                     hex::encode(root)
@@ -1300,7 +1309,7 @@ pub fn validate_parent_clc(
             }
         }
         None => {
-            println!(
+            verification_diagnostic!(
                 "parent_clc lookup failed: no root in window for parent_change={parent_change} \
                  (window has {} entries)",
                 recent_roots.len()
@@ -1334,7 +1343,7 @@ pub fn validate_sigref(
     match sigref_map.get(&uid) {
         Some(&(prev_change_id, _)) => {
             if sig_ref != prev_change_id {
-                println!(
+                verification_diagnostic!(
                     "Sigref chain broken at change {current_change_id}: \
                      uid={uid}, expected sig_ref={prev_change_id}, got sig_ref={sig_ref}"
                 );
@@ -1343,7 +1352,7 @@ pub fn validate_sigref(
         }
         None => {
             if sig_ref != 0 {
-                println!(
+                verification_diagnostic!(
                     "Sigref chain broken at change {current_change_id}: \
                      uid={uid} has no prior change, expected sig_ref=0, got sig_ref={sig_ref}"
                 );
@@ -1829,7 +1838,7 @@ fn decode_postcard_pruned_tree(pruned_tree_bytes: &[u8]) -> Option<merk::Node> {
     let pruned_tree: crate::PrunedMerkleTree = match postcard::from_bytes(pruned_tree_bytes) {
         Ok(p) => p,
         Err(e) => {
-            println!("Failed to deserialize pruned tree: {:?}", e);
+            verification_diagnostic!("Failed to deserialize pruned tree: {:?}", e);
             return None;
         }
     };
@@ -1837,7 +1846,7 @@ fn decode_postcard_pruned_tree(pruned_tree_bytes: &[u8]) -> Option<merk::Node> {
     match crate::pruned_to_merk(pruned_tree) {
         Some(t) => Some(t),
         None => {
-            println!("Failed to verify: pruned tree is empty");
+            verification_diagnostic!("Failed to verify: pruned tree is empty");
             None
         }
     }
@@ -1867,14 +1876,16 @@ fn verify_op_sequence_with_tree(
     let end_dc_bytes: [u8; 32] = end_dc.as_bytes().try_into().unwrap();
 
     if !range.start_clc_state.verify_for_change_id(start_change_id) {
-        println!(
+        verification_diagnostic!(
             "FastForwardRange.start_clc_state is inconsistent with start_change_id={}",
             start_change_id
         );
         return false;
     }
     if start_change_id == 0 && range.start_clc_state != initial_clc_state(&start_dc_bytes) {
-        println!("FastForwardRange.start_clc_state does not match MmrTree::initialize(start_dc)");
+        verification_diagnostic!(
+            "FastForwardRange.start_clc_state does not match MmrTree::initialize(start_dc)"
+        );
         return false;
     }
 
@@ -1886,7 +1897,7 @@ fn verify_op_sequence_with_tree(
     match recent_roots.last().copied() {
         Some((last_cid, last_root)) => {
             if last_cid != start_change_id || last_root != start_root {
-                println!(
+                verification_diagnostic!(
                     "recent_roots last entry ({last_cid}) does not match start_change_id \
                      ({start_change_id}) or start_clc_state.root"
                 );
@@ -1895,7 +1906,7 @@ fn verify_op_sequence_with_tree(
         }
         None => {
             if start_change_id != 0 {
-                println!(
+                verification_diagnostic!(
                     "recent_roots must be non-empty for extension chunks \
                      (start_change_id={start_change_id})"
                 );
@@ -1919,7 +1930,7 @@ fn verify_op_sequence_with_tree(
         .end_clc_state
         .verify_for_tree_size(expected_end_tree_size)
     {
-        println!(
+        verification_diagnostic!(
             "FastForwardRange.end_clc_state is inconsistent: tree_size {} != start ({}) + chunk_len ({}), or peaks/root malformed",
             range.end_clc_state.tree_size, range.start_clc_state.tree_size, chunk_len
         );
@@ -1928,7 +1939,7 @@ fn verify_op_sequence_with_tree(
 
     tree.commit();
     if tree.hash() != start_dc_bytes {
-        println!("Failed to verify: computed start root does not match");
+        verification_diagnostic!("Failed to verify: computed start root does not match");
         return false;
     }
 
@@ -1948,13 +1959,15 @@ fn verify_op_sequence_with_tree(
         let entry_i = match ChangelogEntry::from_bytes_for_verification(e_i) {
             Ok(m) => m,
             Err(e) => {
-                println!("Failed to verify changes; Changelog entry didn't parse {e:?}");
+                verification_diagnostic!(
+                    "Failed to verify changes; Changelog entry didn't parse {e:?}"
+                );
                 return false;
             }
         };
 
         if !validate_timestamp_hwm(entry_i.timestamp, timestamp_hwm) {
-            println!(
+            verification_diagnostic!(
                 "Failed to verify changes; entry {current_change_id} timestamp {} is older than HWM {} by more than {TIMESTAMP_HWM_TOLERANCE_SECONDS}s",
                 entry_i.timestamp, *timestamp_hwm
             );
@@ -1974,7 +1987,7 @@ fn verify_op_sequence_with_tree(
         }
 
         if !validate_parent_change(entry_i.parent_change, current_change_id) {
-            println!(
+            verification_diagnostic!(
                 "Failed to verify changes; entry {current_change_id} has invalid \
                  parent_change={} (current_change_id={current_change_id}, \
                  MAX_PARENT_DISTANCE={MAX_PARENT_DISTANCE})",
@@ -1988,7 +2001,7 @@ fn verify_op_sequence_with_tree(
         // server could splice signed entries from a divergent fork into
         // the proven chain
         if !validate_parent_clc(entry_i.parent_change, &entry_i.parent_clc, recent_roots) {
-            println!(
+            verification_diagnostic!(
                 "Failed to verify changes; entry {current_change_id} has invalid \
                  parent_clc for parent_change={}",
                 entry_i.parent_change
@@ -2002,7 +2015,7 @@ fn verify_op_sequence_with_tree(
         {
             Ok(r) => r,
             Err(e) => {
-                println!("Op validation failed at entry {current_change_id}: {e}");
+                verification_diagnostic!("Op validation failed at entry {current_change_id}: {e}");
                 return false;
             }
         };
@@ -2010,7 +2023,9 @@ fn verify_op_sequence_with_tree(
         let writes = match flatten_write_steps(op_result) {
             Ok(w) => w,
             Err(e) => {
-                println!("Op at entry {current_change_id} produced invalid writes: {e}");
+                verification_diagnostic!(
+                    "Op at entry {current_change_id} produced invalid writes: {e}"
+                );
                 return false;
             }
         };
@@ -2018,7 +2033,7 @@ fn verify_op_sequence_with_tree(
         tree = match maybe_tree {
             Some(t) => t,
             None => {
-                println!("Tree became empty after entry {current_change_id}");
+                verification_diagnostic!("Tree became empty after entry {current_change_id}");
                 return false;
             }
         };
@@ -2042,7 +2057,7 @@ fn verify_op_sequence_with_tree(
 
     tree.commit();
     if tree.hash() != end_dc_bytes {
-        println!("Failed to verify changes; ending data root does not match");
+        verification_diagnostic!("Failed to verify changes; ending data root does not match");
         return false;
     }
 
@@ -2050,7 +2065,9 @@ fn verify_op_sequence_with_tree(
         .tree_head()
         .expect("working tree must be non-empty after replay");
     if computed_end != range.end_clc_state {
-        println!("Failed to verify changes; ending tree head does not match replay");
+        verification_diagnostic!(
+            "Failed to verify changes; ending tree head does not match replay"
+        );
         return false;
     }
 
@@ -2086,11 +2103,11 @@ fn decode_compact_pruned_tree(pruned_tree_bytes: &[u8]) -> Option<merk::Node> {
     match crate::decode_pruned_compact_to_merk(pruned_tree_bytes) {
         Ok(Some(t)) => Some(t),
         Ok(None) => {
-            println!("Failed to verify: pruned tree is empty");
+            verification_diagnostic!("Failed to verify: pruned tree is empty");
             None
         }
         Err(e) => {
-            println!("Failed to decode compact pruned tree into Merk: {:?}", e);
+            verification_diagnostic!("Failed to decode compact pruned tree into Merk: {:?}", e);
             None
         }
     }
@@ -2143,14 +2160,16 @@ fn verify_op_sequence_timed_inner(
     let end_dc_bytes: [u8; 32] = end_dc.as_bytes().try_into().unwrap();
 
     if !range.start_clc_state.verify_for_change_id(start_change_id) {
-        println!(
+        verification_diagnostic!(
             "FastForwardRange.start_clc_state is inconsistent with start_change_id={}",
             start_change_id
         );
         return (false, timings);
     }
     if start_change_id == 0 && range.start_clc_state != initial_clc_state(&start_dc_bytes) {
-        println!("FastForwardRange.start_clc_state does not match MmrTree::initialize(start_dc)");
+        verification_diagnostic!(
+            "FastForwardRange.start_clc_state does not match MmrTree::initialize(start_dc)"
+        );
         return (false, timings);
     }
 
@@ -2162,7 +2181,7 @@ fn verify_op_sequence_timed_inner(
     match recent_roots.last().copied() {
         Some((last_cid, last_root)) => {
             if last_cid != start_change_id || last_root != start_root {
-                println!(
+                verification_diagnostic!(
                     "recent_roots last entry ({last_cid}) does not match start_change_id \
                      ({start_change_id}) or start_clc_state.root"
                 );
@@ -2171,7 +2190,7 @@ fn verify_op_sequence_timed_inner(
         }
         None => {
             if start_change_id != 0 {
-                println!(
+                verification_diagnostic!(
                     "recent_roots must be non-empty for extension chunks \
                      (start_change_id={start_change_id})"
                 );
@@ -2195,7 +2214,7 @@ fn verify_op_sequence_timed_inner(
         .end_clc_state
         .verify_for_tree_size(expected_end_tree_size)
     {
-        println!(
+        verification_diagnostic!(
             "FastForwardRange.end_clc_state is inconsistent: tree_size {} != start ({}) + chunk_len ({}), or peaks/root malformed",
             range.end_clc_state.tree_size, range.start_clc_state.tree_size, chunk_len
         );
@@ -2208,11 +2227,11 @@ fn verify_op_sequence_timed_inner(
     let mut tree = match crate::decode_pruned_compact_to_merk(pruned_tree_bytes) {
         Ok(Some(t)) => t,
         Ok(None) => {
-            println!("Failed to verify: pruned tree is empty");
+            verification_diagnostic!("Failed to verify: pruned tree is empty");
             return (false, timings);
         }
         Err(e) => {
-            println!("Failed to decode compact pruned tree into Merk: {:?}", e);
+            verification_diagnostic!("Failed to decode compact pruned tree into Merk: {:?}", e);
             return (false, timings);
         }
     };
@@ -2227,7 +2246,7 @@ fn verify_op_sequence_timed_inner(
     timings.pruned_tree_root_check_cycles = cycle_count() - t0;
     timings.pruned_tree_cycles = cycle_count() - pruned_tree_t0;
     if !start_root_matches {
-        println!("Failed to verify: computed start root does not match");
+        verification_diagnostic!("Failed to verify: computed start root does not match");
         return (false, timings);
     }
 
@@ -2248,14 +2267,16 @@ fn verify_op_sequence_timed_inner(
         let entry_i = match ChangelogEntry::from_bytes_for_verification(e_i) {
             Ok(m) => m,
             Err(e) => {
-                println!("Failed to verify changes; Changelog entry didn't parse {e:?}");
+                verification_diagnostic!(
+                    "Failed to verify changes; Changelog entry didn't parse {e:?}"
+                );
                 return (false, timings);
             }
         };
         timings.entry_decode_cycles += cycle_count() - t0;
 
         if !validate_timestamp_hwm(entry_i.timestamp, timestamp_hwm) {
-            println!(
+            verification_diagnostic!(
                 "Failed to verify changes; entry {current_change_id} timestamp {} is older than HWM {} by more than {TIMESTAMP_HWM_TOLERANCE_SECONDS}s",
                 entry_i.timestamp, *timestamp_hwm
             );
@@ -2276,7 +2297,7 @@ fn verify_op_sequence_timed_inner(
         }
 
         if !validate_parent_change(entry_i.parent_change, current_change_id) {
-            println!(
+            verification_diagnostic!(
                 "Failed to verify changes; entry {current_change_id} has invalid \
                  parent_change={} (current_change_id={current_change_id})",
                 entry_i.parent_change
@@ -2289,7 +2310,7 @@ fn verify_op_sequence_timed_inner(
         // server could splice signed entries from a divergent fork into
         // the proven chain.
         if !validate_parent_clc(entry_i.parent_change, &entry_i.parent_clc, recent_roots) {
-            println!(
+            verification_diagnostic!(
                 "Failed to verify changes; entry {current_change_id} has invalid \
                  parent_clc for parent_change={}",
                 entry_i.parent_change
@@ -2306,7 +2327,7 @@ fn verify_op_sequence_timed_inner(
         {
             Ok(r) => r,
             Err(e) => {
-                println!("Op validation failed at entry {current_change_id}: {e}");
+                verification_diagnostic!("Op validation failed at entry {current_change_id}: {e}");
                 return (false, timings);
             }
         };
@@ -2317,7 +2338,9 @@ fn verify_op_sequence_timed_inner(
         let writes = match flatten_write_steps(op_result) {
             Ok(w) => w,
             Err(e) => {
-                println!("Op at entry {current_change_id} produced invalid writes: {e}");
+                verification_diagnostic!(
+                    "Op at entry {current_change_id} produced invalid writes: {e}"
+                );
                 return (false, timings);
             }
         };
@@ -2328,7 +2351,7 @@ fn verify_op_sequence_timed_inner(
         tree = match maybe_tree {
             Some(t) => t,
             None => {
-                println!("Tree became empty after entry {current_change_id}");
+                verification_diagnostic!("Tree became empty after entry {current_change_id}");
                 return (false, timings);
             }
         };
@@ -2354,7 +2377,7 @@ fn verify_op_sequence_timed_inner(
     let t0 = cycle_count();
     tree.commit();
     if tree.hash() != end_dc_bytes {
-        println!("Failed to verify changes; ending data root does not match");
+        verification_diagnostic!("Failed to verify changes; ending data root does not match");
         return (false, timings);
     }
 
@@ -2362,7 +2385,9 @@ fn verify_op_sequence_timed_inner(
         .tree_head()
         .expect("working tree must be non-empty after replay");
     if computed_end != range.end_clc_state {
-        println!("Failed to verify changes; ending tree head does not match replay");
+        verification_diagnostic!(
+            "Failed to verify changes; ending tree head does not match replay"
+        );
         return (false, timings);
     }
     timings.final_replay_cycles = cycle_count() - t0;

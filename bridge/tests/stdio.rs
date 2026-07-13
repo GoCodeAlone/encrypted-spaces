@@ -28,17 +28,25 @@ struct Bridge {
 
 impl Bridge {
     fn spawn(client_label: &str) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_encrypted-spaces-bridge"))
+        Self::spawn_with_log_filter(client_label, None)
+    }
+
+    fn spawn_with_log_filter(client_label: &str, log_filter: Option<&str>) -> Self {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_encrypted-spaces-bridge"));
+        command
             .env("ENCRYPTED_SPACES_CLIENT_LABEL", client_label)
             .env(
                 "ENCRYPTED_SPACES_SCHEMA_PATH",
                 concat!(env!("CARGO_MANIFEST_DIR"), "/../demos/tauri/app_schema.kdl"),
             )
+            .env_remove("RUST_LOG")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn bridge");
+            .stderr(Stdio::piped());
+        if let Some(filter) = log_filter {
+            command.env("RUST_LOG", filter);
+        }
+        let mut child = command.spawn().expect("spawn bridge");
         let stdin = child.stdin.take().expect("bridge stdin");
         let stdout = child.stdout.take().expect("bridge stdout");
         let stderr = child.stderr.take().expect("bridge stderr");
@@ -175,6 +183,26 @@ impl Drop for Bridge {
         }
         self.join_readers();
     }
+}
+
+#[test]
+fn protocol_bridge_diagnostics_use_stderr_without_corrupting_jsonl() {
+    let mut bridge =
+        Bridge::spawn_with_log_filter(DEFAULT_CLIENT_LABEL, Some("encrypted_spaces_bridge=debug"));
+    bridge.send_request("diagnostic-hello", "hello", json!({}));
+
+    let response = bridge.receive();
+    assert_eq!(response["request_id"], "diagnostic-hello");
+    assert_eq!(response["ok"], true);
+
+    bridge.close_stdin();
+    bridge.expect_stdout_eof();
+    let (status, stderr) = bridge.finish();
+    assert!(status.success(), "bridge exited with {status}");
+    assert!(
+        stderr.contains("bridge diagnostics initialized"),
+        "configured diagnostics were not emitted to stderr: {stderr}"
+    );
 }
 
 fn request(request_id: &str, operation: &str, payload: Value) -> String {
