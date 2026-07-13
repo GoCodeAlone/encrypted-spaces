@@ -120,6 +120,8 @@ export ENCRYPTED_SPACES_SCHEMA_PATH=/path/to/app-schema.kdl
 export ENCRYPTED_SPACES_BACKEND_URL=ws://127.0.0.1:8080/ws
 # Optional, 1..3600000; defaults to 30000.
 export ENCRYPTED_SPACES_REQUEST_TIMEOUT_MS=30000
+# Optional diagnostics go to stderr; the default filter is `warn`.
+export RUST_LOG=encrypted_spaces_sdk=info,encrypted_spaces_changelog_core=debug
 encrypted-spaces-bridge
 ```
 
@@ -127,6 +129,9 @@ Requests cannot override the schema, data commitment, or fast-forward guest
 image ID. `hello` reports those process-derived trust values and the diagnostic
 client label. The label is not an identity or authorization claim; Space
 credentials and membership proofs establish authorization. The
+bridge reserves stdout for JSONL responses. Configurable host SDK and verifier
+diagnostics use stderr through the standard `RUST_LOG` filter; verifier code
+inside a RISC Zero guest uses the zkVM debug console instead. The
 bridge supports Space create/join/snapshot/restore/sync, table insert/select,
 scoped list and collaborative text operations, encrypted file put/get,
 member invite/join/remove, cancellation, close, and shutdown. Request and

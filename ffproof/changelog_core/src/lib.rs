@@ -1,3 +1,5 @@
+#![cfg_attr(not(test), deny(clippy::print_stdout))]
+
 // Core modules (merk-only)
 pub mod changelog;
 pub mod mmr_tree;

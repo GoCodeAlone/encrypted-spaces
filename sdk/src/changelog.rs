@@ -1999,7 +1999,7 @@ impl Space {
         let mut deferred_sigref: Option<(SigrefMap, SigrefEntries)> = None;
 
         if let Some(ref proof) = ff_data.proof {
-            println!(
+            log::info!(
                 "Received FF proof covering changes up to {}, proof size: {} bytes",
                 proof.end_change_id,
                 proof.proof.len()
@@ -2019,7 +2019,7 @@ impl Space {
             let end_clc: [u8; 32] = range.end_clc_state.root.into();
             let proof_timestamp_hwm = range.timestamp_hwm;
 
-            println!(
+            log::info!(
                 "FF proof verified: start_dc={}, end_dc={}",
                 hex::encode(start_dc),
                 hex::encode(end_dc)
@@ -2059,7 +2059,7 @@ impl Space {
                     range.end_change_id
                 )));
             }
-            println!("FF proof start_dc matches initial_dc");
+            log::info!("FF proof start_dc matches initial_dc");
 
             // Branch-continuity check. Bind the client's prior
             // changelog position to the FF proof's `end_clc_state` by
@@ -2101,7 +2101,7 @@ impl Space {
                          change_id={prior_change_id}"
                     )));
                 }
-                println!("FF branch continuity verified at change_id={prior_change_id}");
+                log::info!("FF branch continuity verified at change_id={prior_change_id}");
             } else if proof.from_inclusion_proof.is_some() {
                 // Defensive: a from_change_id==0 request should not
                 // come back with a from_inclusion_proof; reject rather
@@ -2154,7 +2154,7 @@ impl Space {
                 None
             };
 
-            println!(
+            log::info!(
                 "FF proof CLCs: start={}, end={}",
                 hex::encode(start_clc),
                 hex::encode(end_clc)
@@ -2254,7 +2254,7 @@ impl Space {
                 self.with_state_mut(|state| {
                     state.current_data_commitment = end_dc;
                 });
-                println!(
+                log::info!(
                     "Set data commitment from FF proof end_dc: {}",
                     hex::encode(end_dc)
                 );
@@ -2266,13 +2266,13 @@ impl Space {
                 self.with_state_mut(|state| {
                     state.current_data_commitment = first_old_root;
                 });
-                println!(
+                log::info!(
                     "Set data commitment from first ragged change's old_root: {}",
                     hex::encode(first_old_root)
                 );
             }
 
-            println!(
+            log::info!(
                 "Client state updated to change_id {} via verified FF proof",
                 proof.end_change_id
             );
@@ -2518,7 +2518,7 @@ impl Space {
                 ))
             })?;
         }
-        println!(
+        log::info!(
             "Sigref chain verified: {} user signature(s) checked",
             sigref_map.len()
         );
