@@ -82,6 +82,17 @@ jobs:
             .rust_toolchain == env.RUST_VERSION and
             .risc0_version == env.RISC0_VERSION and
             .risc0_rust_version == env.RISC0_RUST_VERSION and
+            .guest_methods.version == 1 and
+            ([.guest_methods.packages[].name] == [
+              "encrypted-spaces-ffproof-methods",
+              "encrypted-spaces-client-methods",
+              "ffproof-tracer-methods"
+            ]) and
+            (all(.guest_methods.packages[].methods[];
+              (.sha256 | test("^[0-9a-f]{64}$")) and
+              (.image_id | length == 8) and
+              (any(.image_id[]; . != 0))
+            )) and
             (.artifacts | length == 8) and
             ([.artifacts[].archive] | unique | length == 8)
           ' dist/release-manifest.json
@@ -102,21 +113,60 @@ jobs:
             echo "is_release=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Attest release archives with GitHub OIDC
-        id: attest
-        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763
-        with:
-          subject-path: dist/*.tar.gz
-
-      - name: Preserve signed attestation bundle
+      - name: Write verified release source predicate
         shell: bash
         env:
-          ATTESTATION_BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+          HEAD_SHA: ${{ steps.source.outputs.head_sha }}
+          RELEASE_WORKFLOW_RUN_ID: ${{ github.event.workflow_run.id }}
         run: |
           set -euo pipefail
-          test -s "$ATTESTATION_BUNDLE"
+          jq -n \
+            --arg release_head_sha "$HEAD_SHA" \
+            --arg release_repository "$GITHUB_REPOSITORY" \
+            --arg release_source_ref "$(jq -r .source_ref dist/release-manifest.json)" \
+            --arg release_source_ref_type "$(jq -r .source_ref_type dist/release-manifest.json)" \
+            --arg release_workflow_run_id "$RELEASE_WORKFLOW_RUN_ID" \
+            --arg upstream_commit "$UPSTREAM_COMMIT" \
+            '{
+              release_head_sha: $release_head_sha,
+              release_repository: $release_repository,
+              release_source_ref: $release_source_ref,
+              release_source_ref_type: $release_source_ref_type,
+              release_workflow_run_id: ($release_workflow_run_id | tonumber),
+              upstream_commit: $upstream_commit
+            }' > "$RUNNER_TEMP/release-source-predicate.json"
+
+      - name: Attest publisher provenance with GitHub OIDC
+        id: provenance-attest
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/release-manifest.json
+
+      - name: Attest verified release source binding
+        id: source-attest
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/release-manifest.json
+          predicate-type: https://gocodealone.com/attestations/encrypted-spaces-source/v1
+          predicate-path: ${{ runner.temp }}/release-source-predicate.json
+
+      - name: Preserve signed attestation bundles
+        shell: bash
+        env:
+          PROVENANCE_ATTESTATION_BUNDLE: ${{ steps.provenance-attest.outputs.bundle-path }}
+          SOURCE_ATTESTATION_BUNDLE: ${{ steps.source-attest.outputs.bundle-path }}
+        run: |
+          set -euo pipefail
+          test -s "$PROVENANCE_ATTESTATION_BUNDLE"
+          test -s "$SOURCE_ATTESTATION_BUNDLE"
           mkdir -p dist/provenance
-          cp "$ATTESTATION_BUNDLE" dist/provenance/release.intoto.jsonl
+          cat "$PROVENANCE_ATTESTATION_BUNDLE" "$SOURCE_ATTESTATION_BUNDLE" \
+            > dist/provenance/release.intoto.jsonl
+          test -s dist/provenance/release.intoto.jsonl
 
       - name: Upload trusted complete release
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

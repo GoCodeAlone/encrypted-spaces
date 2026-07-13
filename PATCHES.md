@@ -20,11 +20,13 @@ This ledger records the intentional delta from upstream commit
   multi-process membership, verified synchronization, revocation, and every
   bridge data primitive.
 - Adds native Linux/macOS amd64/arm64 release automation with real RISC Zero
-  guest builds, in-process real-proof-enabled binaries, a packaged-runtime real
-  receipt gate, checksums, GitHub OIDC-signed artifact attestations, Apache
-  attribution, and tag-only GitHub release publication. Build/tag code is
-  unprivileged; a default-branch `workflow_run` validates exact `main` ancestry
-  before attestation or publication.
+  guest builds, a checksum-verified architecture-independent guest bundle for
+  native embedding, in-process real-proof-enabled binaries, a packaged-runtime
+  real receipt gate without build-only RISC Zero tools, checksums, GitHub
+  OIDC-signed artifact and manifest attestations with an explicit originating
+  release-run source binding, Apache attribution, and tag-only GitHub release
+  publication. Build/tag code is unprivileged; a default-branch `workflow_run`
+  validates exact `main` ancestry before attestation or publication.
 - Adds weekly upstream merge PRs whose exact head and fork/upstream ancestry are
   checked by a correlated trusted-main, read-only, no-secret compatibility
   workflow and revalidated immediately before ancestry-preserving merge.
