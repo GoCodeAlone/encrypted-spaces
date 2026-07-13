@@ -372,7 +372,6 @@ impl Runtime {
     }
 
     pub fn dispatch(&mut self, request: Request) -> Response {
-        let _ = &self.executor;
         match request.operation {
             Operation::Hello => Response::success(
                 request.request_id,
@@ -583,7 +582,10 @@ impl Runtime {
         let Some(space) = self.space.as_ref() else {
             return invalid_state(request_id);
         };
-        if payload.space_id != space.id().to_string() || payload.where_clause.len() != 1 {
+        if payload.space_id != space.id().to_string() {
+            return invalid_state(request_id);
+        }
+        if payload.where_clause.len() != 1 {
             return invalid_request(request_id);
         }
         let (column, value) = payload
@@ -1480,6 +1482,29 @@ mod tests {
         assert_eq!(
             response.error.as_ref().map(|error| error.code),
             Some("ACCESS_DENIED")
+        );
+    }
+
+    #[test]
+    fn table_select_rejects_other_active_space_as_invalid_state() {
+        let (mut runtime, space_id, row_id) = revoked_member_runtime();
+
+        let response = runtime.table_select(
+            "wrong-space-select".to_owned(),
+            json!({
+                "space_id": format!("different-{space_id}"),
+                "table": "records",
+                "where": {"id": row_id},
+            }),
+        );
+
+        assert!(
+            !response.ok,
+            "table.select accepted a different active Space"
+        );
+        assert_eq!(
+            response.error.as_ref().map(|error| error.code),
+            Some("INVALID_STATE")
         );
     }
 
