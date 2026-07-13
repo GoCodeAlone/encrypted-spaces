@@ -2406,6 +2406,41 @@ fn guest_bundle_tool_normalizes_and_verifies_generated_methods() {
     {
         use std::os::unix::fs::symlink;
 
+        let manifest_path = output.join("manifest.json");
+        let manifest = fs::read(&manifest_path).expect("read guest bundle manifest");
+        let checksum_path = output.join("SHA256SUMS");
+        let checksums = fs::read_to_string(&checksum_path).expect("read guest bundle checksums");
+        let checksums_without_manifest = checksums
+            .lines()
+            .filter(|line| !line.ends_with("  manifest.json"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        let outside_manifest = fixture.join("outside-manifest.json");
+        fs::write(&outside_manifest, b"not JSON").expect("write outside manifest");
+        fs::write(&checksum_path, checksums_without_manifest).expect("remove manifest checksum");
+        fs::remove_file(&manifest_path).expect("remove bundled manifest");
+        symlink(&outside_manifest, &manifest_path).expect("symlink manifest outside bundle");
+        let symlinked_manifest = Command::new("python3")
+            .arg(&script)
+            .arg("verify")
+            .arg("--bundle-dir")
+            .arg(&output)
+            .output()
+            .expect("run symlinked manifest verify");
+        assert!(
+            !symlinked_manifest.status.success(),
+            "symlinked manifest was accepted"
+        );
+        let stderr = String::from_utf8_lossy(&symlinked_manifest.stderr);
+        assert!(
+            stderr.contains("symlink is not allowed in guest bundle: manifest.json"),
+            "manifest was read before symlink validation: {stderr}"
+        );
+        fs::remove_file(&manifest_path).expect("remove manifest symlink");
+        fs::write(&manifest_path, manifest).expect("restore guest bundle manifest");
+        fs::write(&checksum_path, checksums).expect("restore guest bundle checksums");
+
         let elf_path = output.join("encrypted-spaces-ffproof-methods/extend_ff.bin");
         let outside = fixture.join("outside-extend-ff.bin");
         fs::write(&outside, b"extend-elf").expect("write outside guest ELF");

@@ -155,7 +155,7 @@ def verify(bundle_dir: Path) -> None:
             raise SystemExit(f"checksum mismatch: {relative}")
         checked.add(relative)
 
-    manifest_path = bundle_dir / "manifest.json"
+    manifest_path = safe_relative(bundle_dir, "manifest.json")
     manifest = json.loads(manifest_path.read_text())
     if manifest.get("version") != VERSION:
         raise SystemExit("unsupported guest bundle version")
