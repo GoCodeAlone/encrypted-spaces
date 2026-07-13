@@ -117,7 +117,7 @@ jobs:
             fork_main_sha="$3"
             upstream_sha="$4"
             correlation_id="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${candidate_sha:0:12}"
-            run_title="upstream-compat $candidate_sha $correlation_id"
+            run_title="upstream-compat $candidate_sha $fork_main_sha $upstream_sha $correlation_id"
             gh workflow run "$workflow" --ref main \
               -f "candidate_sha=$candidate_sha" \
               -f "fork_main_sha=$fork_main_sha" \

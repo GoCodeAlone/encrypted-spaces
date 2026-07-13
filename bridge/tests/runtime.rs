@@ -2210,6 +2210,9 @@ fn upstream_sync_opens_ci_gated_automerge_prs() {
     assert!(workflow.contains("candidate_sha"));
     assert!(workflow.contains("candidate_sha=\"$(git rev-parse \"origin/$branch\")\""));
     assert!(workflow.contains("correlation_id"));
+    assert!(workflow.contains(
+        "run_title=\"upstream-compat $candidate_sha $fork_main_sha $upstream_sha $correlation_id\""
+    ));
     assert!(workflow.contains("--json databaseId,displayTitle,headSha"));
     assert!(workflow.contains("gh pr view \"$PR_URL\""));
     assert!(!workflow.contains("trigger_and_wait build-prototype.yml"));
@@ -2234,6 +2237,18 @@ fn upstream_sync_opens_ci_gated_automerge_prs() {
     assert!(compatibility.contains("fetch-depth: 0"));
     assert!(compatibility.contains("git merge-base --is-ancestor \"$FORK_MAIN_SHA\" HEAD"));
     assert!(compatibility.contains("git merge-base --is-ancestor \"$UPSTREAM_SHA\" HEAD"));
+    assert!(compatibility.contains(
+        "run-name: upstream-compat ${{ inputs.candidate_sha }} ${{ inputs.fork_main_sha }} ${{ inputs.upstream_sha }} ${{ inputs.correlation_id }}"
+    ));
+    assert!(compatibility.contains("test \"$CANDIDATE_SHA\" = \"$UPSTREAM_SHA\""));
+    assert!(compatibility.contains("candidate_line=\"$(git rev-list --parents -n 1 HEAD)\""));
+    assert!(compatibility
+        .contains("test \"$candidate_line\" = \"$CANDIDATE_SHA $FORK_MAIN_SHA $UPSTREAM_SHA\""));
+    assert!(compatibility.contains(
+        "expected_tree=\"$(git merge-tree --write-tree \"$FORK_MAIN_SHA\" \"$UPSTREAM_SHA\")\""
+    ));
+    assert!(compatibility
+        .contains("test \"$(git rev-parse \"$CANDIDATE_SHA^{tree}\")\" = \"$expected_tree\""));
     assert!(compatibility.contains("persist-credentials: false"));
     assert!(!compatibility.contains("secrets."));
     assert!(compatibility.contains("cargo fmt --all -- --check"));

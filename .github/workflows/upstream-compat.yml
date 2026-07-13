@@ -1,5 +1,5 @@
 name: Trusted Upstream Compatibility
-run-name: upstream-compat ${{ inputs.candidate_sha }} ${{ inputs.correlation_id }}
+run-name: upstream-compat ${{ inputs.candidate_sha }} ${{ inputs.fork_main_sha }} ${{ inputs.upstream_sha }} ${{ inputs.correlation_id }}
 
 on:
   workflow_dispatch:
@@ -57,6 +57,14 @@ jobs:
           test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
           git merge-base --is-ancestor "$FORK_MAIN_SHA" HEAD
           git merge-base --is-ancestor "$UPSTREAM_SHA" HEAD
+          if git merge-base --is-ancestor "$FORK_MAIN_SHA" "$UPSTREAM_SHA"; then
+            test "$CANDIDATE_SHA" = "$UPSTREAM_SHA"
+          else
+            candidate_line="$(git rev-list --parents -n 1 HEAD)"
+            test "$candidate_line" = "$CANDIDATE_SHA $FORK_MAIN_SHA $UPSTREAM_SHA"
+            expected_tree="$(git merge-tree --write-tree "$FORK_MAIN_SHA" "$UPSTREAM_SHA")"
+            test "$(git rev-parse "$CANDIDATE_SHA^{tree}")" = "$expected_tree"
+          fi
 
       - name: Install trusted build dependencies
         shell: bash
