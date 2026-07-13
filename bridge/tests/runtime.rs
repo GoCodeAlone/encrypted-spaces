@@ -2186,6 +2186,25 @@ fn release_contract_builds_and_publishes_native_assets() {
 }
 
 #[test]
+fn ci_prebuilds_bridge_runtime_fixtures_for_nextest() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let workflow = fs::read_to_string(root.join(".github/workflows/build-prototype.yml"))
+        .expect("CI workflow");
+
+    for marker in [
+        "Build bridge runtime fixtures",
+        "matrix.group == 'bridge'",
+        "cargo build --locked -p encrypted-spaces-backend-server -p encrypted-spaces-bridge",
+        "ENCRYPTED_SPACES_BACKEND_TEST_BINARY:",
+        "target/x86_64-unknown-linux-gnu/debug/encrypted-spaces-backend-server",
+        "ENCRYPTED_SPACES_BRIDGE_TEST_BINARY:",
+        "target/x86_64-unknown-linux-gnu/debug/encrypted-spaces-bridge",
+    ] {
+        assert!(workflow.contains(marker), "CI workflow omits {marker}");
+    }
+}
+
+#[test]
 fn upstream_sync_opens_ci_gated_automerge_prs() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
     let workflow = fs::read_to_string(root.join(".github/workflows/upstream-sync.yml"))

@@ -101,7 +101,14 @@ jobs:
         with:
           tool: cargo-nextest
 
+      - name: Build bridge runtime fixtures
+        if: matrix.group == 'bridge'
+        run: cargo build --locked -p encrypted-spaces-backend-server -p encrypted-spaces-bridge
+
       - name: Cargo nextest run (${{ matrix.group }})
+        env:
+          ENCRYPTED_SPACES_BACKEND_TEST_BINARY: ${{ github.workspace }}/target/x86_64-unknown-linux-gnu/debug/encrypted-spaces-backend-server
+          ENCRYPTED_SPACES_BRIDGE_TEST_BINARY: ${{ github.workspace }}/target/x86_64-unknown-linux-gnu/debug/encrypted-spaces-bridge
         run: cargo nextest run ${{ matrix.packages }} --locked ${{ matrix.filter }}
 
       - name: Report disk usage before cache save
