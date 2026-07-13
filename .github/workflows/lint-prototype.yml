@@ -9,6 +9,8 @@ on:
       - '**/*.rs'
       - '**/Cargo.toml'
       - '**/Cargo.lock'
+      - 'rust-toolchain*'
+      - '.cargo/**'
       - '.github/workflows/*.yml'
       - '.github/actions/**'
   pull_request:
@@ -17,6 +19,8 @@ on:
       - '**/*.rs'
       - '**/Cargo.toml'
       - '**/Cargo.lock'
+      - 'rust-toolchain*'
+      - '.cargo/**'
       - '.github/workflows/*.yml'
       - '.github/actions/**'
 
@@ -63,6 +67,25 @@ jobs:
         uses: ./.github/actions/setup-rust-ci
         with:
           ssh-private-key: ${{ secrets.MERK_NOMIC_SSH_KEY }}
+
+      - name: Check nested guest lockfiles
+        shell: bash
+        run: |
+          set -euo pipefail
+          manifests_file="$(mktemp)"
+          trap 'rm -f "$manifests_file"' EXIT
+          find . \
+            -type d \( -name .git -o -name .worktrees -o -name node_modules -o -name target -o -name vendor \) -prune -o \
+            -type f -path '*/guest/Cargo.toml' -print0 | sort -z > "$manifests_file"
+          mapfile -d '' -t manifests < "$manifests_file"
+          if (( ${#manifests[@]} == 0 )); then
+            echo "No nested guest Cargo manifests found" >&2
+            exit 1
+          fi
+          for manifest in "${manifests[@]}"; do
+            cargo fetch --manifest-path "$manifest" --locked
+            cargo metadata --format-version 1 --manifest-path "$manifest" --frozen >/dev/null
+          done
 
       - name: Clippy (full workspace, all targets)
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
