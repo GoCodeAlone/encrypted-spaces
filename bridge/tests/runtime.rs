@@ -19,6 +19,9 @@ const RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
 const EXIT_TIMEOUT: Duration = Duration::from_secs(2);
 const BACKEND_START_TIMEOUT: Duration = Duration::from_secs(10);
 
+type GuestFixtureMethod<'a> = (&'a str, &'a [u8]);
+type GuestFixturePackage<'a> = (&'a str, &'a [GuestFixtureMethod<'a>]);
+
 struct BackendProcess {
     child: Child,
     schema_path: PathBuf,
@@ -2283,7 +2286,7 @@ fn guest_bundle_tool_normalizes_and_verifies_generated_methods() {
     let output = fixture.join("bundle");
     fs::create_dir_all(&target).expect("create synthetic target");
 
-    let packages: [(&str, &[(&str, &[u8])]); 3] = [
+    let packages: [GuestFixturePackage<'_>; 3] = [
         (
             "encrypted-spaces-ffproof-methods",
             &[
