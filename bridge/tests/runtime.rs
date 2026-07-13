@@ -2073,14 +2073,21 @@ fn release_contract_builds_and_publishes_native_assets() {
     assert_pinned_actions(&publisher);
 
     let legal = workflow.find("  legal:").expect("legal job");
+    let guest_methods = workflow
+        .find("  guest-methods:")
+        .expect("guest methods job");
     let assets = workflow.find("  assets:").expect("asset matrix");
     let real_proof = workflow.find("  real-proof:").expect("real proof job");
     let aggregate = workflow.find("  aggregate:").expect("aggregate job");
     assert!(
-        legal < assets && assets < real_proof && real_proof < aggregate,
+        legal < guest_methods
+            && guest_methods < assets
+            && assets < real_proof
+            && real_proof < aggregate,
         "release jobs have unexpected layout"
     );
-    assert!(workflow[assets..real_proof].contains("needs: legal"));
+    assert!(workflow[guest_methods..assets].contains("needs: legal"));
+    assert!(workflow[assets..real_proof].contains("needs: [legal, guest-methods]"));
 
     for marker in [
         "workflow_run:",
@@ -2096,6 +2103,10 @@ fn release_contract_builds_and_publishes_native_assets() {
         "git merge-base --is-ancestor \"$HEAD_SHA\" origin/main",
         "refs/tags/v$RELEASE_VERSION",
         "actions/attest@a1948c3f048ba23858d222213b7c278aabede763",
+        "predicate-type: https://gocodealone.com/attestations/encrypted-spaces-source/v1",
+        "release_head_sha",
+        "release_workflow_run_id",
+        "release_source_ref",
         "attestations: write",
         "id-token: write",
         "bundle-path",
@@ -2137,7 +2148,7 @@ fn release_contract_builds_and_publishes_native_assets() {
         "runtime_packaged_backend_generates_real_fast_forward_receipt",
         "ENCRYPTED_SPACES_REQUIRE_REAL_PROOF: 1",
         "ENCRYPTED_SPACES_REQUEST_TIMEOUT_MS: 3600000",
-        "command -v r0vm",
+        "test -z \"$(command -v r0vm || true)\"",
         "env -u RISC0_DEV_MODE -u RISC0_SKIP_BUILD",
         "test -x",
         "cmp",
@@ -2183,6 +2194,268 @@ fn release_contract_builds_and_publishes_native_assets() {
     assert!(patches.contains(&format!("Rust `{RUST_TOOLCHAIN}`")));
     assert!(!patches.contains("Pending Release Work"));
     assert!(!patches.contains("NOT_IMPLEMENTED"));
+}
+
+#[test]
+fn release_contract_reuses_verified_guest_bundle_on_native_runners() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let workflow = fs::read_to_string(root.join(".github/workflows/release-bridge.yml"))
+        .expect("release workflow");
+    let ffproof_build =
+        fs::read_to_string(root.join("ffproof/methods/build.rs")).expect("ffproof build script");
+    let client_build = fs::read_to_string(root.join("ffproof/client_methods/build.rs"))
+        .expect("client methods build script");
+    let tracer_build = fs::read_to_string(root.join("ffproof/tracer/methods/build.rs"))
+        .expect("tracer methods build script");
+    let prebuilt_support = fs::read_to_string(root.join("ffproof/prebuilt_guest.rs"))
+        .expect("prebuilt guest build support");
+    let prepare =
+        fs::read_to_string(root.join(".github/scripts/prepare-encrypted-spaces-guest-bundle.py"))
+            .expect("guest bundle preparation script");
+
+    for marker in [
+        "name: Build and verify real guest methods",
+        "GITHUB_TOKEN: ${{ github.token }}",
+        "python3 .github/scripts/prepare-encrypted-spaces-guest-bundle.py create",
+        "python3 .github/scripts/prepare-encrypted-spaces-guest-bundle.py verify",
+        "name: encrypted-spaces-guest-methods",
+        "ENCRYPTED_SPACES_PREBUILT_GUEST_DIR:",
+        "needs: [legal, guest-methods]",
+        "Install protobuf compiler",
+        "protobuf-compiler",
+        "brew install protobuf",
+        "protoc --version",
+        ".guest_methods.version == 1",
+    ] {
+        assert!(workflow.contains(marker), "release workflow omits {marker}");
+    }
+    assert_eq!(
+        workflow.matches("rzup install cargo-risczero").count(),
+        1,
+        "only the supported guest builder may install cargo-risczero"
+    );
+    assert_eq!(
+        workflow.matches("rzup install r0vm").count(),
+        1,
+        "only the supported guest builder may install r0vm"
+    );
+    assert!(!workflow.contains("mv \"$r0vm_path\""));
+
+    for build_script in [&ffproof_build, &client_build, &tracer_build] {
+        assert!(build_script.contains("prebuilt_guest::embed"));
+    }
+    for marker in [
+        "ENCRYPTED_SPACES_PREBUILT_GUEST_DIR",
+        "methods.rs",
+        "rerun-if-env-changed",
+        "rustc-env",
+    ] {
+        assert!(
+            prebuilt_support.contains(marker),
+            "prebuilt guest support omits {marker}"
+        );
+    }
+    for marker in [
+        "SHA256SUMS",
+        "manifest.json",
+        "include_bytes!(concat!(",
+        "GUEST_DIR_ENV",
+        "encrypted-spaces-ffproof-methods",
+        "encrypted-spaces-client-methods",
+        "ffproof-tracer-methods",
+        "zero guest image ID",
+    ] {
+        assert!(
+            prepare.contains(marker),
+            "guest bundle script omits {marker}"
+        );
+    }
+}
+
+#[test]
+fn guest_bundle_tool_normalizes_and_verifies_generated_methods() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let fixture = std::env::temp_dir().join(format!(
+        "encrypted-spaces-guest-bundle-{}",
+        std::process::id()
+    ));
+    let target = fixture.join("target");
+    let output = fixture.join("bundle");
+    fs::create_dir_all(&target).expect("create synthetic target");
+
+    let packages: [(&str, &[(&str, &[u8])]); 3] = [
+        (
+            "encrypted-spaces-ffproof-methods",
+            &[
+                ("EXTEND_FF", b"extend-elf".as_slice()),
+                ("HASH_TEST", b"hash-elf".as_slice()),
+            ],
+        ),
+        (
+            "encrypted-spaces-client-methods",
+            &[
+                ("CHECK_ENTRY", b"entry-elf".as_slice()),
+                ("CHECK_NONCE", b"nonce-elf".as_slice()),
+            ],
+        ),
+        (
+            "ffproof-tracer-methods",
+            &[("BENCH_TRACER", b"tracer-elf".as_slice())],
+        ),
+    ];
+    for (package, methods) in packages {
+        let generated = target
+            .join("release/build")
+            .join(format!("{package}-fixture/out"));
+        fs::create_dir_all(&generated).expect("create generated methods directory");
+        let mut source = String::new();
+        for (index, (name, bytes)) in methods.iter().copied().enumerate() {
+            let elf = fixture.join(format!("{}.bin", name.to_ascii_lowercase()));
+            fs::write(&elf, bytes).expect("write synthetic guest ELF");
+            source.push_str(&format!(
+                "pub const {name}_ELF: &[u8] = include_bytes!({elf:?});\n\
+                 pub const {name}_PATH: &str = {elf:?};\n\
+                 pub const {name}_ID: [u32; 8] = [{}, 2, 3, 4, 5, 6, 7, 8];\n",
+                index + 1
+            ));
+        }
+        fs::write(generated.join("methods.rs"), source).expect("write generated methods");
+    }
+
+    let script = root.join(".github/scripts/prepare-encrypted-spaces-guest-bundle.py");
+    let create = Command::new("python3")
+        .arg(&script)
+        .args(["create", "--target-dir"])
+        .arg(&target)
+        .arg("--output-dir")
+        .arg(&output)
+        .status()
+        .expect("run guest bundle create");
+    assert!(create.success(), "guest bundle creation failed");
+
+    let normalized = fs::read_to_string(output.join("encrypted-spaces-ffproof-methods/methods.rs"))
+        .expect("normalized methods");
+    assert!(normalized.contains(
+        "include_bytes!(concat!(env!(\"ENCRYPTED_SPACES_PREBUILT_GUEST_DIR\"), \
+         \"/encrypted-spaces-ffproof-methods/extend_ff.bin\"))"
+    ));
+    assert!(normalized.contains("EXTEND_FF_ID: [u32; 8] = [1, 2, 3, 4, 5, 6, 7, 8]"));
+
+    let verify = Command::new("python3")
+        .arg(&script)
+        .arg("verify")
+        .arg("--bundle-dir")
+        .arg(&output)
+        .status()
+        .expect("run guest bundle verify");
+    assert!(verify.success(), "guest bundle verification failed");
+
+    let probe_source = fixture.join("guest_bundle_probe.rs");
+    let probe_binary = fixture.join("guest_bundle_probe");
+    fs::write(
+        &probe_source,
+        format!(
+            "include!({:?});\n\
+             fn main() {{\n\
+                 assert_eq!(EXTEND_FF_ELF, b\"extend-elf\");\n\
+                 assert_eq!(EXTEND_FF_ID, [1, 2, 3, 4, 5, 6, 7, 8]);\n\
+             }}\n",
+            output.join("encrypted-spaces-ffproof-methods/methods.rs")
+        ),
+    )
+    .expect("write guest bundle probe");
+    let compile_probe = Command::new("rustc")
+        .env("ENCRYPTED_SPACES_PREBUILT_GUEST_DIR", &output)
+        .arg(&probe_source)
+        .arg("-o")
+        .arg(&probe_binary)
+        .status()
+        .expect("compile guest bundle probe");
+    assert!(
+        compile_probe.success(),
+        "guest bundle probe did not compile"
+    );
+    let probe = Command::new(&probe_binary)
+        .status()
+        .expect("run guest bundle probe");
+    assert!(probe.success(), "guest bundle probe failed");
+
+    let methods_relative = "encrypted-spaces-ffproof-methods/methods.rs";
+    let methods_path = output.join(methods_relative);
+    fs::write(&methods_path, format!("{normalized}// substituted\n"))
+        .expect("substitute normalized methods");
+    rewrite_bundle_checksum(&output, methods_relative);
+    let substituted = Command::new("python3")
+        .arg(&script)
+        .arg("verify")
+        .arg("--bundle-dir")
+        .arg(&output)
+        .status()
+        .expect("run substituted guest bundle verify");
+    assert!(
+        !substituted.success(),
+        "substituted normalized methods were accepted"
+    );
+    fs::write(&methods_path, &normalized).expect("restore normalized methods");
+    rewrite_bundle_checksum(&output, methods_relative);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+
+        let elf_path = output.join("encrypted-spaces-ffproof-methods/extend_ff.bin");
+        let outside = fixture.join("outside-extend-ff.bin");
+        fs::write(&outside, b"extend-elf").expect("write outside guest ELF");
+        fs::remove_file(&elf_path).expect("remove bundled guest ELF");
+        symlink(&outside, &elf_path).expect("symlink guest ELF outside bundle");
+        let symlinked = Command::new("python3")
+            .arg(&script)
+            .arg("verify")
+            .arg("--bundle-dir")
+            .arg(&output)
+            .status()
+            .expect("run symlinked guest bundle verify");
+        assert!(!symlinked.success(), "symlinked guest ELF was accepted");
+        fs::remove_file(&elf_path).expect("remove guest ELF symlink");
+        fs::write(&elf_path, b"extend-elf").expect("restore guest ELF");
+    }
+
+    fs::write(
+        output.join("encrypted-spaces-ffproof-methods/extend_ff.bin"),
+        b"tampered",
+    )
+    .expect("tamper guest ELF");
+    let tampered = Command::new("python3")
+        .arg(&script)
+        .arg("verify")
+        .arg("--bundle-dir")
+        .arg(&output)
+        .status()
+        .expect("run tampered guest bundle verify");
+    assert!(!tampered.success(), "tampered guest bundle was accepted");
+
+    fs::remove_dir_all(fixture).expect("remove guest bundle fixture");
+}
+
+fn rewrite_bundle_checksum(bundle: &Path, relative: &str) {
+    let checksum_path = bundle.join("SHA256SUMS");
+    let digest = format!(
+        "{:x}",
+        Sha256::digest(fs::read(bundle.join(relative)).expect("read bundle file"))
+    );
+    let checksum = fs::read_to_string(&checksum_path).expect("read bundle checksums");
+    let updated = checksum
+        .lines()
+        .map(|line| {
+            if line.ends_with(&format!("  {relative}")) {
+                format!("{digest}  {relative}")
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(checksum_path, format!("{updated}\n")).expect("rewrite bundle checksum");
 }
 
 #[test]

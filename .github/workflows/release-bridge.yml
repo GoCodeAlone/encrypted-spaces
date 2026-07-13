@@ -48,9 +48,58 @@ jobs:
           grep -Fq 'channel = "1.94.1"' rust-toolchain.toml
           grep -Fq 'real-proofs = ["encrypted-spaces-ffproof/real-proofs"]' bridge/Cargo.toml
 
+  guest-methods:
+    name: Build and verify real guest methods
+    needs: legal
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout pinned source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Install protobuf compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes protobuf-compiler
+          protoc --version
+
+      - name: Install pinned Rust and RISC Zero
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          cargo install rzup --version "$RZUP_VERSION" --locked
+          rzup install cargo-risczero "$RISC0_VERSION"
+          rzup install r0vm "$RISC0_VERSION"
+          rzup install rust "$RISC0_RUST_VERSION"
+
+      - name: Build and normalize real guest methods
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo risczero --version
+          RISC0_BUILD_LOCKED=1 rustup run "$RUST_VERSION" cargo build --locked --release \
+            -p encrypted-spaces-bridge --features real-proofs
+          python3 .github/scripts/prepare-encrypted-spaces-guest-bundle.py create \
+            --target-dir target \
+            --output-dir "$RUNNER_TEMP/encrypted-spaces-guest-methods"
+          python3 .github/scripts/prepare-encrypted-spaces-guest-bundle.py verify \
+            --bundle-dir "$RUNNER_TEMP/encrypted-spaces-guest-methods"
+
+      - name: Upload verified guest methods
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: encrypted-spaces-guest-methods
+          path: ${{ runner.temp }}/encrypted-spaces-guest-methods
+          if-no-files-found: error
+          retention-days: 7
+
   assets:
     name: ${{ matrix.archive }}
-    needs: legal
+    needs: [legal, guest-methods]
     strategy:
       fail-fast: false
       matrix:
@@ -104,41 +153,68 @@ jobs:
             target: macos-arm64
             archive: encrypted-spaces-bridge-macos-arm64.tar.gz
     runs-on: ${{ matrix.os }}
+    env:
+      ENCRYPTED_SPACES_PREBUILT_GUEST_DIR: ${{ github.workspace }}/.release-guests
     steps:
       - name: Checkout pinned source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
 
-      - name: Install pinned Rust and RISC Zero
+      - name: Download verified guest methods
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: encrypted-spaces-guest-methods
+          path: ${{ github.workspace }}/.release-guests
+
+      - name: Verify guest methods
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/prepare-encrypted-spaces-guest-bundle.py verify \
+            --bundle-dir "$ENCRYPTED_SPACES_PREBUILT_GUEST_DIR"
+
+      - name: Install pinned Rust
         shell: bash
         run: |
           set -euo pipefail
           rustup toolchain install "$RUST_VERSION" --profile minimal
-          cargo install rzup --version "$RZUP_VERSION" --locked
-          rzup install cargo-risczero "$RISC0_VERSION"
-          rzup install r0vm "$RISC0_VERSION"
-          rzup install rust "$RISC0_RUST_VERSION"
 
-      - name: Build real guest ELFs and native binary
+      - name: Install protobuf compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            sudo apt-get update
+            sudo apt-get install --yes protobuf-compiler
+          else
+            brew install protobuf
+          fi
+          protoc --version
+
+      - name: Embed verified guest ELFs and build native binary
         shell: bash
         env:
           PACKAGE: ${{ matrix.package }}
           BINARY: ${{ matrix.binary }}
         run: |
           set -euo pipefail
-          cargo risczero --version
           rustup run "$RUST_VERSION" cargo test --locked -p "$PACKAGE" --features real-proofs --no-run
           rustup run "$RUST_VERSION" cargo build --locked --release -p "$PACKAGE" --features real-proofs
           built="$GITHUB_WORKSPACE/target/release/$BINARY"
           test -x "$built"
-          methods="$(find target/release/build -path '*/out/methods.rs' -type f -print)"
-          test -n "$methods"
-          while IFS= read -r method; do
-            grep -Eq 'ELF:.*&\[[^]]' "$method"
+          for methods_package in \
+            encrypted-spaces-ffproof-methods \
+            encrypted-spaces-client-methods \
+            ffproof-tracer-methods; do
+            method="$(find target/release/build \
+              -path "*/$methods_package-*/out/methods.rs" -type f -print)"
+            test -n "$method"
+            test "$(printf '%s\n' "$method" | wc -l | tr -d ' ')" = 1
+            cmp "$method" "$ENCRYPTED_SPACES_PREBUILT_GUEST_DIR/$methods_package/methods.rs"
             if grep -Eq 'ID: \[u32; 8\] = \[0, 0, 0, 0, 0, 0, 0, 0\]' "$method"; then
               echo "zero guest image ID in $method" >&2
               exit 1
             fi
-          done <<< "$methods"
+          done
           echo "BUILT_BINARY=$built" >> "$GITHUB_ENV"
 
       - name: Launch release backend and bridge API suite
@@ -204,19 +280,38 @@ jobs:
     name: Packaged Linux real-proof gate
     needs: assets
     runs-on: ubuntu-24.04
+    env:
+      ENCRYPTED_SPACES_PREBUILT_GUEST_DIR: ${{ github.workspace }}/.release-guests
     steps:
       - name: Checkout pinned source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
 
-      - name: Install pinned Rust and RISC Zero
+      - name: Download verified guest methods
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: encrypted-spaces-guest-methods
+          path: ${{ github.workspace }}/.release-guests
+
+      - name: Verify guest methods
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/prepare-encrypted-spaces-guest-bundle.py verify \
+            --bundle-dir "$ENCRYPTED_SPACES_PREBUILT_GUEST_DIR"
+
+      - name: Install pinned Rust
         shell: bash
         run: |
           set -euo pipefail
           rustup toolchain install "$RUST_VERSION" --profile minimal
-          cargo install rzup --version "$RZUP_VERSION" --locked
-          rzup install cargo-risczero "$RISC0_VERSION"
-          rzup install r0vm "$RISC0_VERSION"
-          rzup install rust "$RISC0_RUST_VERSION"
+
+      - name: Install protobuf compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes protobuf-compiler
+          protoc --version
 
       - name: Download packaged Linux backend
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
@@ -253,10 +348,6 @@ jobs:
           export ENCRYPTED_SPACES_BRIDGE_TEST_BINARY="$RUNNER_TEMP/release-runtime/encrypted-spaces-bridge-linux-amd64/encrypted-spaces-bridge"
           test -x "$ENCRYPTED_SPACES_BACKEND_TEST_BINARY"
           test -x "$ENCRYPTED_SPACES_BRIDGE_TEST_BINARY"
-          r0vm_path="$(command -v r0vm)"
-          hidden_r0vm="$RUNNER_TEMP/r0vm-build-only"
-          mv "$r0vm_path" "$hidden_r0vm"
-          trap 'mv "$hidden_r0vm" "$r0vm_path"' EXIT
           test -z "$(command -v r0vm || true)"
           env -u RISC0_DEV_MODE -u RISC0_SKIP_BUILD \
             rustup run "$RUST_VERSION" cargo test --locked \
@@ -289,6 +380,19 @@ jobs:
           path: dist
           merge-multiple: true
 
+      - name: Download verified guest manifest
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: encrypted-spaces-guest-methods
+          path: guest-methods
+
+      - name: Verify guest methods
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/prepare-encrypted-spaces-guest-bundle.py verify \
+            --bundle-dir guest-methods
+
       - name: Generate checksums and manifest
         shell: bash
         run: |
@@ -306,6 +410,8 @@ jobs:
           toolchain = os.environ["RUST_VERSION"]
           fork_commit = os.environ["GITHUB_SHA"]
           repository = os.environ["GITHUB_REPOSITORY"]
+          guest_manifest = dist.parent / "guest-methods" / "manifest.json"
+          guest_methods = json.loads(guest_manifest.read_text())
           artifacts = []
           for archive in sorted(dist.glob("*.tar.gz")):
               parts = archive.name.removesuffix(".tar.gz").split("-")
@@ -335,6 +441,7 @@ jobs:
               "rust_toolchain": toolchain,
               "risc0_version": os.environ["RISC0_VERSION"],
               "risc0_rust_version": os.environ["RISC0_RUST_VERSION"],
+              "guest_methods": guest_methods,
               "artifacts": artifacts,
           }
           (dist / "release-manifest.json").write_text(
@@ -360,6 +467,17 @@ jobs:
             .rust_toolchain == env.RUST_VERSION and
             .risc0_version == env.RISC0_VERSION and
             .risc0_rust_version == env.RISC0_RUST_VERSION and
+            .guest_methods.version == 1 and
+            ([.guest_methods.packages[].name] == [
+              "encrypted-spaces-ffproof-methods",
+              "encrypted-spaces-client-methods",
+              "ffproof-tracer-methods"
+            ]) and
+            (all(.guest_methods.packages[].methods[];
+              (.sha256 | test("^[0-9a-f]{64}$")) and
+              (.image_id | length == 8) and
+              (any(.image_id[]; . != 0))
+            )) and
             (.artifacts | length == 8) and
             ([.artifacts[].archive] | unique | length == 8) and
             all(.artifacts[];
