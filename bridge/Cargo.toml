@@ -1,0 +1,27 @@
+[package]
+name = "encrypted-spaces-bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Bounded JSONL runtime bridge boundary for encrypted spaces"
+
+[features]
+default = []
+real-proofs = ["encrypted-spaces-ffproof/real-proofs"]
+
+[[bin]]
+name = "encrypted-spaces-bridge"
+path = "src/main.rs"
+
+[dependencies]
+base64.workspace = true
+encrypted-spaces-ffproof = { workspace = true, features = ["prove"] }
+encrypted-spaces-sdk = { workspace = true, features = ["local-transport"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

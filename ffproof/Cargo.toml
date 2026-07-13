@@ -62,4 +62,4 @@ verify = []
 # `client_methods` crates which trigger the RISC-V guest binary build.
 prove = ["verify", "dep:encrypted-spaces-ffproof-methods", "dep:encrypted-spaces-client-methods"]
 cuda = ["risc0-zkvm/cuda"]
-real-proofs = []
+real-proofs = ["risc0-zkvm/prove"]

@@ -1,0 +1,178 @@
+name: Weekly Upstream Sync
+
+on:
+  schedule:
+    - cron: '17 9 * * 1'
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout fork main
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Fetch upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/encrypted-spaces/prototype.git
+          git fetch upstream main
+
+      - name: Open or reuse compatibility PR
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "Fork already contains upstream main"
+            echo "url=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          upstream_sha="$(git rev-parse upstream/main)"
+          fork_main_sha="$(git rev-parse main)"
+          branch="automation/upstream-sync-${upstream_sha:0:12}"
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          existing="$(gh pr list \
+            --repo "$GITHUB_REPOSITORY" \
+            --state open \
+            --head "$branch" \
+            --json url \
+            --jq '.[0].url // empty')"
+          if [[ -n "$existing" ]]; then
+            git fetch origin "$branch"
+            if git merge-base --is-ancestor main "origin/$branch" && \
+              git merge-base --is-ancestor upstream/main "origin/$branch"; then
+              echo "compatible=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "compatible=false" >> "$GITHUB_OUTPUT"
+            fi
+            candidate_sha="$(git rev-parse "origin/$branch")"
+            {
+              echo "url=$existing"
+              echo "branch=$branch"
+              echo "candidate_sha=$candidate_sha"
+              echo "fork_main_sha=$fork_main_sha"
+              echo "upstream_sha=$upstream_sha"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git switch -c "$branch"
+          if git merge --no-edit upstream/main; then
+            compatible=true
+          else
+            git merge --abort
+            git switch -C "$branch" upstream/main
+            compatible=false
+          fi
+          git push origin "HEAD:refs/heads/$branch"
+          url="$(gh pr create \
+            --repo "$GITHUB_REPOSITORY" \
+            --base main \
+            --head "$branch" \
+            --title "chore: sync encrypted-spaces upstream" \
+            --body "Automated weekly compatibility update to upstream commit \`$upstream_sha\`. Normal pull-request checks validate the fork delta and runtime bridge.")"
+          candidate_sha="$(git rev-parse "origin/$branch")"
+          {
+            echo "url=$url"
+            echo "branch=$branch"
+            echo "compatible=$compatible"
+            echo "candidate_sha=$candidate_sha"
+            echo "fork_main_sha=$fork_main_sha"
+            echo "upstream_sha=$upstream_sha"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Run compatibility CI and merge when green
+        if: steps.pr.outputs.url != '' && steps.pr.outputs.compatible == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_URL: ${{ steps.pr.outputs.url }}
+          CANDIDATE_SHA: ${{ steps.pr.outputs.candidate_sha }}
+          FORK_MAIN_SHA: ${{ steps.pr.outputs.fork_main_sha }}
+          UPSTREAM_SHA: ${{ steps.pr.outputs.upstream_sha }}
+          SYNC_BRANCH: ${{ steps.pr.outputs.branch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          trigger_and_wait() {
+            workflow="$1"
+            candidate_sha="$2"
+            fork_main_sha="$3"
+            upstream_sha="$4"
+            correlation_id="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${candidate_sha:0:12}"
+            run_title="upstream-compat $candidate_sha $fork_main_sha $upstream_sha $correlation_id"
+            gh workflow run "$workflow" --ref main \
+              -f "candidate_sha=$candidate_sha" \
+              -f "fork_main_sha=$fork_main_sha" \
+              -f "upstream_sha=$upstream_sha" \
+              -f "correlation_id=$correlation_id"
+            run_id=""
+            for _ in $(seq 1 60); do
+              run_id="$(gh run list --workflow "$workflow" --branch main \
+                --event workflow_dispatch --limit 100 \
+                --json databaseId,displayTitle,headSha | \
+                jq -r --arg title "$run_title" --arg head "$fork_main_sha" \
+                  '.[] | select(.displayTitle == $title and .headSha == $head) | .databaseId' | \
+                head -n 1)"
+              if [[ -n "$run_id" ]]; then
+                break
+              fi
+              sleep 5
+            done
+            [[ -n "$run_id" ]] || return 1
+            timeout 3600 gh run watch "$run_id" --exit-status
+            gh run view "$run_id" --json displayTitle,headSha,event,conclusion | \
+              jq -e --arg title "$run_title" --arg head "$fork_main_sha" '
+                .displayTitle == $title and
+                .headSha == $head and
+                .event == "workflow_dispatch" and
+                .conclusion == "success"
+              ' >/dev/null
+          }
+
+          if ! trigger_and_wait upstream-compat.yml "$CANDIDATE_SHA" "$FORK_MAIN_SHA" "$UPSTREAM_SHA"; then
+            echo "$PR_URL remains open for conflicts, failing checks, or review"
+            exit 0
+          fi
+          gh pr view "$PR_URL" --json headRefOid,baseRefOid,state | \
+            jq -e --arg head "$CANDIDATE_SHA" --arg base "$FORK_MAIN_SHA" '
+              .headRefOid == $head and .baseRefOid == $base and .state == "OPEN"
+            ' >/dev/null || {
+              echo "$PR_URL remains open because its tested head or base changed"
+              exit 0
+            }
+          git fetch origin main "$SYNC_BRANCH"
+          test "$(git rev-parse origin/main)" = "$FORK_MAIN_SHA"
+          test "$(git rev-parse "origin/$SYNC_BRANCH")" = "$CANDIDATE_SHA"
+          git merge-base --is-ancestor "$FORK_MAIN_SHA" "$CANDIDATE_SHA"
+          if git push \
+            --force-with-lease="refs/heads/main:$FORK_MAIN_SHA" \
+            origin "$CANDIDATE_SHA:refs/heads/main"; then
+            echo "Merged compatible upstream sync $PR_URL"
+            git push origin --delete "$SYNC_BRANCH" || true
+          else
+            echo "$PR_URL remains open because main changed after compatibility passed"
+          fi
+
+      - name: Report incompatible sync
+        if: steps.pr.outputs.url != '' && steps.pr.outputs.compatible != 'true'
+        env:
+          PR_URL: ${{ steps.pr.outputs.url }}
+        run: echo "$PR_URL remains open for conflicts, failing checks, or review"

@@ -2,7 +2,7 @@ use crate::error::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Schema {
     pub name: String,
     pub columns: Vec<ColumnDefinition>,
@@ -37,7 +37,7 @@ impl Schema {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ColumnDefinition {
     pub name: String,
     pub column_type: ColumnType,

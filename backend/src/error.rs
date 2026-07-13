@@ -31,6 +31,10 @@ pub enum SdkError {
     UpdateError(String),
     DeleteError(String),
     TransactionCommitError(String),
+    /// A mutating request entered transport transmission, but no response was
+    /// received before its deadline. The caller must reconcile remote state
+    /// before retrying because the server may have committed the operation.
+    CommitOutcomeUnknown(String),
     InvalidRowData(String),
     BackendError(String),
     /// Client is out of sync with the server and must run a fast-forward
@@ -77,6 +81,7 @@ impl fmt::Display for SdkError {
             SdkError::TransactionCommitError(msg) => {
                 write!(f, "Failed to commit transaction: {msg}")
             }
+            SdkError::CommitOutcomeUnknown(msg) => write!(f, "Commit outcome unknown: {msg}"),
             SdkError::InvalidRowData(msg) => write!(f, "Invalid row data: {msg}"),
             SdkError::BackendError(msg) => write!(f, "Backend error: {msg}"),
             SdkError::FastForwardRequired { reason } => {

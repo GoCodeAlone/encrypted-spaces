@@ -103,6 +103,87 @@ synchronization with the backend behind the scenes.
 See [`sdk/README.md`](sdk/README.md) for an overview, code examples, and
 quickstart instructions.
 
+## Runtime bridge
+
+The `encrypted-spaces-bridge` binary exposes the Rust SDK as bounded,
+versioned JSONL RPC over standard input and output. It is intended for
+non-Rust clients that need the prototype's actual encryption, verification,
+storage, synchronization, and membership behavior without reimplementing
+those algorithms.
+
+Each process owns one untrusted diagnostic label, one schema trust bundle, one
+backend endpoint, and at most one active Space. Configure them before launch:
+
+```sh
+export ENCRYPTED_SPACES_CLIENT_LABEL=local-client
+export ENCRYPTED_SPACES_SCHEMA_PATH=/path/to/app-schema.kdl
+export ENCRYPTED_SPACES_BACKEND_URL=ws://127.0.0.1:8080/ws
+# Optional, 1..3600000; defaults to 30000.
+export ENCRYPTED_SPACES_REQUEST_TIMEOUT_MS=30000
+encrypted-spaces-bridge
+```
+
+Requests cannot override the schema, data commitment, or fast-forward guest
+image ID. `hello` reports those process-derived trust values and the diagnostic
+client label. The label is not an identity or authorization claim; Space
+credentials and membership proofs establish authorization. The
+bridge supports Space create/join/snapshot/restore/sync, table insert/select,
+scoped list and collaborative text operations, encrypted file put/get,
+member invite/join/remove, cancellation, close, and shutdown. Request and
+response payloads use protocol version `1`; request frames larger than 64 KiB
+are rejected, and oversized results are replaced by a correlated
+`RESPONSE_TOO_LARGE` error. A waiting `space.sync` wakes on an SDK-applied
+remote update or its configured timeout and reports that cause as
+`wait_trigger`. It is cancellable while waiting or queued for the runtime;
+once verified synchronization starts, it runs to completion so cancellation
+cannot leave provisional cryptographic state behind. Native SDK WebSocket and
+file requests share a bounded process-configured deadline that defaults to 30
+seconds and can be raised to one hour for real proof generation. Timed-out or
+canceled requests remove their abandoned correlation entries. HTTP response
+bodies are streamed with a 64 MiB ceiling before bridge response encoding.
+Opaque list and text references include the creating Space ID and cannot be
+reused after the process activates another Space.
+
+If a mutating WebSocket request times out after transmission begins, the bridge
+returns `COMMIT_UNKNOWN` rather than reporting a definite failure. The backend
+may have committed the operation; clients must synchronize and inspect current
+state before deciding whether another mutation is required.
+
+Restore validates the snapshot's initial commitment, application schemas and
+actions, fast-forward guest image ID, and matching snapshot/authentication
+Space IDs against the process configuration before authenticating or
+activating the Space. A foreign or identity-inconsistent snapshot fails with
+`TRUST_MISMATCH` instead of replacing process-pinned trust roots.
+
+`text.edit` validates positions before mutation and preserves typed SDK errors
+when its first operation is rejected. Because a replacement can span multiple
+SDK commits, a failure in the second operation after a successful delete
+returns `PARTIAL_COMMIT`; clients must synchronize and read the document before
+continuing rather than retrying the edit blindly.
+
+Invites and snapshots contain private client custody material and must be
+stored as secrets. The backend remains untrusted and stores ciphertext and
+proof material, but loss of a client snapshot can prevent that client from
+recovering its Space state. This bridge does not add authentication to the
+prototype server.
+
+Release archives contain native backend and bridge binaries for Linux and
+macOS on amd64 and arm64, together with checksums, provenance, and Apache
+attribution. Release binaries enable the `real-proofs` feature and embed real,
+nonzero RISC Zero guest images, including the in-process prover needed on a
+clean host. The packaged-binary API conformance suite sets `RISC0_DEV_MODE=1`
+explicitly to test runtime behavior without performing a full proof for every
+API case; a separate Linux release gate launches the packaged bridge and
+release backend, removes `r0vm` from the runtime environment, and has a second
+client verify a real fast-forward receipt with development mode unset. Both
+binaries report their release with `--version`.
+
+The build and real-proof workflow is read-only and cannot attest or publish.
+A separate `workflow_run` publisher loaded from the default branch verifies
+that the completed run's exact commit is on `main`, rechecks every archive and
+checksum, and only then obtains OIDC attestation or release permissions. A tag
+is publishable only when `v0.1.0` resolves to that verified `main` commit.
+
 ## Prerequisites
 
 The Rust toolchain is pinned by [`rust-toolchain.toml`](rust-toolchain.toml)

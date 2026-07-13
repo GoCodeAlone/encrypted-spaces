@@ -239,9 +239,48 @@ impl Space {
     /// rides along inside the snapshot, so callers don't need to
     /// re-supply it on restore.
     pub async fn restore(transport: impl Transport, snapshot: serde_json::Value) -> Result<Self> {
-        let snapshot: SpaceSnapshot = serde_json::from_value(snapshot)
-            .map_err(|e| SdkError::SerializationError(e.to_string()))?;
+        let snapshot = decode_snapshot(snapshot)?;
 
+        Self::restore_decoded(transport, snapshot).await
+    }
+
+    /// Restore a snapshot only when its cryptographic and application trust
+    /// bundle matches the caller's expected schema configuration.
+    pub async fn restore_trusted(
+        transport: impl Transport,
+        snapshot: serde_json::Value,
+        expected: crate::ApplicationSchema,
+    ) -> Result<Self> {
+        let snapshot = decode_snapshot(snapshot)?;
+        let (initial_dc, table_schemas, actions, ff_image_id) = expected.into_parts().await?;
+        let snapshot_application_schemas: HashMap<_, _> = snapshot
+            .state
+            .table_schemas
+            .iter()
+            .filter(|(name, _)| {
+                !encrypted_spaces_backend::internal_schemas::is_reserved_table_name(name)
+            })
+            .map(|(name, schema)| (name.clone(), schema.clone()))
+            .collect();
+        let space_ids_match = snapshot
+            .space_id
+            .as_ref()
+            .is_some_and(|space_id| *space_id == snapshot.state.auth_context.space_id);
+        if !space_ids_match
+            || snapshot.state.initial_dc != initial_dc
+            || snapshot.state.ff_image_id != ff_image_id
+            || snapshot_application_schemas != table_schemas
+            || snapshot.state.actions != actions
+        {
+            return Err(SdkError::ValidationError(
+                "snapshot trust bundle mismatch".to_owned(),
+            ));
+        }
+
+        Self::restore_decoded(transport, snapshot).await
+    }
+
+    async fn restore_decoded(transport: impl Transport, snapshot: SpaceSnapshot) -> Result<Self> {
         let space_id = snapshot.space_id.unwrap_or_else(SpaceId::random);
 
         let key_manager = snapshot.key_manager.ok_or_else(|| {
@@ -266,6 +305,10 @@ impl Space {
     pub fn uid(&self) -> Option<u32> {
         self.with_state(|state| state.auth_context.uid.map(|uid| uid as u32))
     }
+}
+
+fn decode_snapshot(snapshot: serde_json::Value) -> Result<SpaceSnapshot> {
+    serde_json::from_value(snapshot).map_err(|e| SdkError::SerializationError(e.to_string()))
 }
 
 #[cfg(test)]

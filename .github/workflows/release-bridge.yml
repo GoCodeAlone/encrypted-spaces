@@ -1,0 +1,382 @@
+name: Encrypted Spaces Release
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+env:
+  RELEASE_READY: true
+  RELEASE_VERSION: 0.1.0
+  UPSTREAM_COMMIT: 4cda0ae87698135aa672990e6e68cf7873847426
+  RUST_VERSION: 1.94.1
+  RZUP_VERSION: 0.5.1
+  RISC0_VERSION: 3.0.5
+  RISC0_RUST_VERSION: 1.94.1
+
+jobs:
+  legal:
+    name: Legal and source contract
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout pinned source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+
+      - name: Verify legal, version, and source records
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$RELEASE_READY" = true
+          test "$RELEASE_VERSION" = "${GITHUB_REF_NAME#v}" || test "$GITHUB_REF_TYPE" != tag
+          git merge-base --is-ancestor "$UPSTREAM_COMMIT" "$GITHUB_SHA"
+          test -s LICENSE
+          test -s NOTICE
+          test -s PATCHES.md
+          grep -Fq "$UPSTREAM_COMMIT" PATCHES.md
+          grep -Fq '800495f' PATCHES.md
+          grep -Fq "Rust \`$RUST_VERSION\`" PATCHES.md
+          grep -Fq 'version = "0.1.0"' Cargo.toml
+          grep -Fq 'kdl = { version = "=6.5.0"' Cargo.toml
+          grep -Fq 'version = "6.5.0"' Cargo.lock
+          grep -Fq 'channel = "1.94.1"' rust-toolchain.toml
+          grep -Fq 'real-proofs = ["encrypted-spaces-ffproof/real-proofs"]' bridge/Cargo.toml
+
+  assets:
+    name: ${{ matrix.archive }}
+    needs: legal
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - component: backend
+            package: encrypted-spaces-backend-server
+            binary: encrypted-spaces-backend-server
+            os: ubuntu-24.04
+            target: linux-amd64
+            archive: encrypted-spaces-backend-linux-amd64.tar.gz
+          - component: backend
+            package: encrypted-spaces-backend-server
+            binary: encrypted-spaces-backend-server
+            os: ubuntu-24.04-arm
+            target: linux-arm64
+            archive: encrypted-spaces-backend-linux-arm64.tar.gz
+          - component: backend
+            package: encrypted-spaces-backend-server
+            binary: encrypted-spaces-backend-server
+            os: macos-15-intel
+            target: macos-amd64
+            archive: encrypted-spaces-backend-macos-amd64.tar.gz
+          - component: backend
+            package: encrypted-spaces-backend-server
+            binary: encrypted-spaces-backend-server
+            os: macos-14
+            target: macos-arm64
+            archive: encrypted-spaces-backend-macos-arm64.tar.gz
+          - component: bridge
+            package: encrypted-spaces-bridge
+            binary: encrypted-spaces-bridge
+            os: ubuntu-24.04
+            target: linux-amd64
+            archive: encrypted-spaces-bridge-linux-amd64.tar.gz
+          - component: bridge
+            package: encrypted-spaces-bridge
+            binary: encrypted-spaces-bridge
+            os: ubuntu-24.04-arm
+            target: linux-arm64
+            archive: encrypted-spaces-bridge-linux-arm64.tar.gz
+          - component: bridge
+            package: encrypted-spaces-bridge
+            binary: encrypted-spaces-bridge
+            os: macos-15-intel
+            target: macos-amd64
+            archive: encrypted-spaces-bridge-macos-amd64.tar.gz
+          - component: bridge
+            package: encrypted-spaces-bridge
+            binary: encrypted-spaces-bridge
+            os: macos-14
+            target: macos-arm64
+            archive: encrypted-spaces-bridge-macos-arm64.tar.gz
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout pinned source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Install pinned Rust and RISC Zero
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          cargo install rzup --version "$RZUP_VERSION" --locked
+          rzup install cargo-risczero "$RISC0_VERSION"
+          rzup install r0vm "$RISC0_VERSION"
+          rzup install rust "$RISC0_RUST_VERSION"
+
+      - name: Build real guest ELFs and native binary
+        shell: bash
+        env:
+          PACKAGE: ${{ matrix.package }}
+          BINARY: ${{ matrix.binary }}
+        run: |
+          set -euo pipefail
+          cargo risczero --version
+          rustup run "$RUST_VERSION" cargo test --locked -p "$PACKAGE" --features real-proofs --no-run
+          rustup run "$RUST_VERSION" cargo build --locked --release -p "$PACKAGE" --features real-proofs
+          built="$GITHUB_WORKSPACE/target/release/$BINARY"
+          test -x "$built"
+          methods="$(find target/release/build -path '*/out/methods.rs' -type f -print)"
+          test -n "$methods"
+          while IFS= read -r method; do
+            grep -Eq 'ELF:.*&\[[^]]' "$method"
+            if grep -Eq 'ID: \[u32; 8\] = \[0, 0, 0, 0, 0, 0, 0, 0\]' "$method"; then
+              echo "zero guest image ID in $method" >&2
+              exit 1
+            fi
+          done <<< "$methods"
+          echo "BUILT_BINARY=$built" >> "$GITHUB_ENV"
+
+      - name: Launch release backend and bridge API suite
+        if: matrix.component == 'bridge'
+        shell: bash
+        env:
+          ENCRYPTED_SPACES_BRIDGE_TEST_BINARY: ${{ github.workspace }}/target/release/encrypted-spaces-bridge
+          ENCRYPTED_SPACES_BACKEND_TEST_BINARY: ${{ github.workspace }}/target/release/encrypted-spaces-backend-server
+          RISC0_DEV_MODE: 1
+        run: |
+          set -euo pipefail
+          rustup run "$RUST_VERSION" cargo build --locked --release \
+            -p encrypted-spaces-backend-server --features real-proofs
+          rustup run "$RUST_VERSION" cargo test -p encrypted-spaces-bridge --locked --features real-proofs runtime_ -- --test-threads=1
+
+      - name: Package and inspect native asset
+        shell: bash
+        env:
+          COMPONENT: ${{ matrix.component }}
+          TARGET: ${{ matrix.target }}
+          ARCHIVE: ${{ matrix.archive }}
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/package/encrypted-spaces-$COMPONENT-$TARGET"
+          mkdir -p "$root" "$RUNNER_TEMP/dist"
+          packaged="$root/encrypted-spaces-$COMPONENT"
+          cp "$BUILT_BINARY" "$packaged"
+          chmod +x "$packaged"
+          cp LICENSE NOTICE PATCHES.md "$root/"
+          cmp "$BUILT_BINARY" "$packaged"
+
+          description="$(file -b "$packaged")"
+          case "$TARGET" in
+            linux-amd64) grep -Eq 'ELF 64-bit.*(x86-64|x86_64)' <<< "$description" ;;
+            linux-arm64) grep -Eq 'ELF 64-bit.*(ARM aarch64|aarch64)' <<< "$description" ;;
+            macos-amd64) grep -Eq 'Mach-O 64-bit.*x86_64' <<< "$description" ;;
+            macos-arm64) grep -Eq 'Mach-O 64-bit.*arm64' <<< "$description" ;;
+            *) exit 1 ;;
+          esac
+
+          output="$("$packaged" --version)"
+          grep -Fq "$RELEASE_VERSION" <<< "$output"
+          tar -czf "$RUNNER_TEMP/dist/$ARCHIVE" -C "$RUNNER_TEMP/package" "$(basename "$root")"
+          listing="$(tar -tzf "$RUNNER_TEMP/dist/$ARCHIVE")"
+          for required in "encrypted-spaces-$COMPONENT" LICENSE NOTICE PATCHES.md; do
+            grep -Eq "/$required$" <<< "$listing"
+          done
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            sha256sum "$RUNNER_TEMP/dist/$ARCHIVE"
+          else
+            shasum -a 256 "$RUNNER_TEMP/dist/$ARCHIVE"
+          fi
+
+      - name: Upload native asset
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-${{ matrix.component }}-${{ matrix.target }}
+          path: ${{ runner.temp }}/dist/${{ matrix.archive }}
+          if-no-files-found: error
+          retention-days: 7
+
+  real-proof:
+    name: Packaged Linux real-proof gate
+    needs: assets
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout pinned source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Install pinned Rust and RISC Zero
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          cargo install rzup --version "$RZUP_VERSION" --locked
+          rzup install cargo-risczero "$RISC0_VERSION"
+          rzup install r0vm "$RISC0_VERSION"
+          rzup install rust "$RISC0_RUST_VERSION"
+
+      - name: Download packaged Linux backend
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: release-backend-linux-amd64
+          path: dist
+
+      - name: Download packaged Linux bridge
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: release-bridge-linux-amd64
+          path: dist
+
+      - name: Build the real-proof integration harness
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup run "$RUST_VERSION" cargo test --locked \
+            -p encrypted-spaces-bridge --features real-proofs --test runtime --no-run
+
+      - name: Generate and verify a real packaged fast-forward receipt
+        shell: bash
+        env:
+          ENCRYPTED_SPACES_REQUIRE_REAL_PROOF: 1
+          ENCRYPTED_SPACES_REQUEST_TIMEOUT_MS: 3600000
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/release-runtime"
+          tar -xzf dist/encrypted-spaces-backend-linux-amd64.tar.gz \
+            -C "$RUNNER_TEMP/release-runtime"
+          tar -xzf dist/encrypted-spaces-bridge-linux-amd64.tar.gz \
+            -C "$RUNNER_TEMP/release-runtime"
+          export ENCRYPTED_SPACES_BACKEND_TEST_BINARY="$RUNNER_TEMP/release-runtime/encrypted-spaces-backend-linux-amd64/encrypted-spaces-backend"
+          export ENCRYPTED_SPACES_BRIDGE_TEST_BINARY="$RUNNER_TEMP/release-runtime/encrypted-spaces-bridge-linux-amd64/encrypted-spaces-bridge"
+          test -x "$ENCRYPTED_SPACES_BACKEND_TEST_BINARY"
+          test -x "$ENCRYPTED_SPACES_BRIDGE_TEST_BINARY"
+          r0vm_path="$(command -v r0vm)"
+          hidden_r0vm="$RUNNER_TEMP/r0vm-build-only"
+          mv "$r0vm_path" "$hidden_r0vm"
+          trap 'mv "$hidden_r0vm" "$r0vm_path"' EXIT
+          test -z "$(command -v r0vm || true)"
+          env -u RISC0_DEV_MODE -u RISC0_SKIP_BUILD \
+            rustup run "$RUST_VERSION" cargo test --locked \
+            -p encrypted-spaces-bridge --features real-proofs --test runtime \
+            runtime_packaged_backend_generates_real_fast_forward_receipt -- \
+            --ignored --exact --nocapture --test-threads=1
+
+  aggregate:
+    name: Release contract result
+    if: ${{ always() }}
+    needs: [legal, assets, real-proof]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require all release gates
+        shell: bash
+        env:
+          LEGAL_RESULT: ${{ needs.legal.result }}
+          ASSET_RESULT: ${{ needs.assets.result }}
+          REAL_PROOF_RESULT: ${{ needs.real-proof.result }}
+        run: |
+          set -euo pipefail
+          test "$LEGAL_RESULT" = success
+          test "$ASSET_RESULT" = success
+          test "$REAL_PROOF_RESULT" = success
+
+      - name: Download native assets
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums and manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/checksums
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          dist = Path("dist")
+          version = os.environ["RELEASE_VERSION"]
+          upstream = os.environ["UPSTREAM_COMMIT"]
+          toolchain = os.environ["RUST_VERSION"]
+          fork_commit = os.environ["GITHUB_SHA"]
+          repository = os.environ["GITHUB_REPOSITORY"]
+          artifacts = []
+          for archive in sorted(dist.glob("*.tar.gz")):
+              parts = archive.name.removesuffix(".tar.gz").split("-")
+              component = parts[2]
+              target = "-".join(parts[3:])
+              digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+              (dist / "checksums" / f"{archive.name}.sha256").write_text(
+                  f"{digest}  {archive.name}\n"
+              )
+              artifacts.append({
+                  "component": component,
+                  "target": target,
+                  "archive": archive.name,
+                  "binary": f"encrypted-spaces-{component}",
+                  "version": version,
+                  "sha256": digest,
+              })
+          if len(artifacts) != 8:
+              raise SystemExit(f"expected 8 assets, found {len(artifacts)}")
+          manifest = {
+              "version": version,
+              "upstream_commit": upstream,
+              "fork_commit": fork_commit,
+              "repository": repository,
+              "source_ref": os.environ["GITHUB_REF_NAME"],
+              "source_ref_type": os.environ["GITHUB_REF_TYPE"],
+              "rust_toolchain": toolchain,
+              "risc0_version": os.environ["RISC0_VERSION"],
+              "risc0_rust_version": os.environ["RISC0_RUST_VERSION"],
+              "artifacts": artifacts,
+          }
+          (dist / "release-manifest.json").write_text(
+              json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+          )
+          PY
+
+      - name: Verify aggregate release contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          for checksum in dist/checksums/*.sha256; do
+            (cd dist && sha256sum -c "checksums/$(basename "$checksum")")
+          done
+          test "$(find dist -maxdepth 1 -name '*.tar.gz' | wc -l | tr -d ' ')" = 8
+          jq -e '
+            .version == env.RELEASE_VERSION and
+            .upstream_commit == env.UPSTREAM_COMMIT and
+            .fork_commit == env.GITHUB_SHA and
+            .repository == env.GITHUB_REPOSITORY and
+            .source_ref == env.GITHUB_REF_NAME and
+            .source_ref_type == env.GITHUB_REF_TYPE and
+            .rust_toolchain == env.RUST_VERSION and
+            .risc0_version == env.RISC0_VERSION and
+            .risc0_rust_version == env.RISC0_RUST_VERSION and
+            (.artifacts | length == 8) and
+            ([.artifacts[].archive] | unique | length == 8) and
+            all(.artifacts[];
+              (.sha256 | test("^[0-9a-f]{64}$")) and
+              (.binary == ("encrypted-spaces-" + .component))
+            )
+          ' dist/release-manifest.json
+          for archive in dist/*.tar.gz; do
+            listing="$(tar -tzf "$archive")"
+            grep -Eq '/LICENSE$' <<< "$listing"
+            grep -Eq '/NOTICE$' <<< "$listing"
+          done
+
+      - name: Upload complete release
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-dist
+          path: dist
+          if-no-files-found: error
+          retention-days: 7

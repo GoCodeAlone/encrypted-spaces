@@ -1,0 +1,175 @@
+name: Encrypted Spaces Publish
+
+on:
+  workflow_run:
+    workflows:
+      - Encrypted Spaces Release
+    types: [completed]
+
+permissions:
+  contents: read
+
+env:
+  RELEASE_VERSION: 0.1.0
+  UPSTREAM_COMMIT: 4cda0ae87698135aa672990e6e68cf7873847426
+  RUST_VERSION: 1.94.1
+  RISC0_VERSION: 3.0.5
+  RISC0_RUST_VERSION: 1.94.1
+
+jobs:
+  aggregate:
+    name: Attest trusted release result
+    if: >-
+      ${{ github.event.workflow_run.conclusion == 'success' &&
+          github.event.workflow_run.event == 'push' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      artifact-metadata: write
+      attestations: write
+      contents: read
+      id-token: write
+    outputs:
+      is_release: ${{ steps.verify.outputs.is_release }}
+      head_sha: ${{ steps.source.outputs.head_sha }}
+    steps:
+      - name: Checkout trusted default branch
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Verify completed run source is on main
+        id: source
+        shell: bash
+        env:
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          HEAD_REPOSITORY: ${{ github.event.workflow_run.head_repository.full_name }}
+        run: |
+          set -euo pipefail
+          test "$HEAD_REPOSITORY" = "$GITHUB_REPOSITORY"
+          git fetch origin main:refs/remotes/origin/main
+          git cat-file -e "$HEAD_SHA^{commit}"
+          git merge-base --is-ancestor "$UPSTREAM_COMMIT" "$HEAD_SHA"
+          git merge-base --is-ancestor "$HEAD_SHA" origin/main
+          echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Download completed release contract
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: release-dist
+          path: dist
+          repository: ${{ github.repository }}
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+
+      - name: Verify exact source and release contract
+        id: verify
+        shell: bash
+        env:
+          HEAD_SHA: ${{ steps.source.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          test "$(find dist -maxdepth 1 -name '*.tar.gz' | wc -l | tr -d ' ')" = 8
+          for checksum in dist/checksums/*.sha256; do
+            (cd dist && sha256sum -c "checksums/$(basename "$checksum")")
+          done
+          jq -e '
+            .version == env.RELEASE_VERSION and
+            .upstream_commit == env.UPSTREAM_COMMIT and
+            .fork_commit == env.HEAD_SHA and
+            .repository == env.GITHUB_REPOSITORY and
+            .rust_toolchain == env.RUST_VERSION and
+            .risc0_version == env.RISC0_VERSION and
+            .risc0_rust_version == env.RISC0_RUST_VERSION and
+            (.artifacts | length == 8) and
+            ([.artifacts[].archive] | unique | length == 8)
+          ' dist/release-manifest.json
+          for archive in dist/*.tar.gz; do
+            listing="$(tar -tzf "$archive")"
+            grep -Eq '/LICENSE$' <<< "$listing"
+            grep -Eq '/NOTICE$' <<< "$listing"
+          done
+          source_ref="$(jq -r .source_ref dist/release-manifest.json)"
+          source_ref_type="$(jq -r .source_ref_type dist/release-manifest.json)"
+          if test "$source_ref_type" = tag && test "$source_ref" = "v$RELEASE_VERSION"; then
+            git fetch origin "refs/tags/$source_ref:refs/tags/$source_ref"
+            test "$(git rev-parse "$source_ref^{}")" = "$HEAD_SHA"
+            echo "is_release=true" >> "$GITHUB_OUTPUT"
+          else
+            test "$source_ref_type" = branch
+            test "$source_ref" = main
+            echo "is_release=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Attest release archives with GitHub OIDC
+        id: attest
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763
+        with:
+          subject-path: dist/*.tar.gz
+
+      - name: Preserve signed attestation bundle
+        shell: bash
+        env:
+          ATTESTATION_BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+        run: |
+          set -euo pipefail
+          test -s "$ATTESTATION_BUNDLE"
+          mkdir -p dist/provenance
+          cp "$ATTESTATION_BUNDLE" dist/provenance/release.intoto.jsonl
+
+      - name: Upload trusted complete release
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: trusted-release-dist
+          path: dist
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish GitHub release
+    if: ${{ needs.aggregate.outputs.is_release == 'true' }}
+    needs: aggregate
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Checkout trusted default branch
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Verify immutable release tag is on main
+        shell: bash
+        env:
+          HEAD_SHA: ${{ needs.aggregate.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          git fetch origin main:refs/remotes/origin/main
+          git fetch origin "refs/tags/v$RELEASE_VERSION:refs/tags/v$RELEASE_VERSION"
+          test "$(git rev-parse "v$RELEASE_VERSION^{}")" = "$HEAD_SHA"
+          git merge-base --is-ancestor "$HEAD_SHA" origin/main
+
+      - name: Download trusted complete release
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: trusted-release-dist
+          path: dist
+
+      - name: Publish immutable tag assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test -s dist/provenance/release.intoto.jsonl
+          gh release create "v$RELEASE_VERSION" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --generate-notes \
+            dist/*.tar.gz \
+            dist/checksums/*.sha256 \
+            dist/provenance/*.intoto.jsonl \
+            dist/release-manifest.json

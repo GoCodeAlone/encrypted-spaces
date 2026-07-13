@@ -8,7 +8,7 @@ use std::net::IpAddr;
 // ---------------------------------------------------------------------------
 
 #[derive(Parser)]
-#[command(name = "encrypted-spaces-server")]
+#[command(name = "encrypted-spaces-server", version)]
 #[command(about = "Encrypted Spaces backend server")]
 pub struct CliArgs {
     /// Path to a schema/seed file applied to every new space.
