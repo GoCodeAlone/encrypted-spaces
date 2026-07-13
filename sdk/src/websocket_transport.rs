@@ -55,11 +55,22 @@ enum PendingResponse {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-type NativePendingMap = std::sync::Arc<
-    std::sync::Mutex<
-        std::collections::HashMap<String, tokio::sync::oneshot::Sender<PendingResponse>>,
-    >,
->;
+type NativePendingRequests =
+    std::collections::HashMap<String, tokio::sync::oneshot::Sender<PendingResponse>>;
+
+#[cfg(not(target_arch = "wasm32"))]
+type NativePendingMap = std::sync::Arc<std::sync::Mutex<NativePendingRequests>>;
+
+#[cfg(not(target_arch = "wasm32"))]
+fn lock_pending_requests(
+    pending: &NativePendingMap,
+) -> std::sync::MutexGuard<'_, NativePendingRequests> {
+    pending.lock().unwrap_or_else(|error| {
+        log::warn!("recovering poisoned pending request lock");
+        pending.clear_poison();
+        error.into_inner()
+    })
+}
 
 #[cfg(not(target_arch = "wasm32"))]
 struct PendingRequestGuard {
@@ -80,9 +91,7 @@ impl PendingRequestGuard {
 #[cfg(not(target_arch = "wasm32"))]
 impl Drop for PendingRequestGuard {
     fn drop(&mut self) {
-        if let Ok(mut pending) = self.pending.lock() {
-            pending.remove(&self.request_id);
-        }
+        lock_pending_requests(&self.pending).remove(&self.request_id);
     }
 }
 
@@ -151,10 +160,7 @@ async fn collect_bounded_body(mut body: hyper::Body, limit: usize) -> Result<Vec
 
 #[cfg(not(target_arch = "wasm32"))]
 fn fail_pending_requests(pending: &NativePendingMap, message: &str) {
-    let requests = pending
-        .lock()
-        .map(|mut pending| pending.drain().collect::<Vec<_>>())
-        .unwrap_or_default();
+    let requests = lock_pending_requests(pending).drain().collect::<Vec<_>>();
     for (_, sender) in requests {
         let _ = sender.send(PendingResponse::Db(Err(SdkError::DatabaseError(
             message.to_owned(),
@@ -347,16 +353,14 @@ impl WebSocketTransport {
         // Spawn background read loop
         let task = tokio::spawn(async move {
             use async_tungstenite::tungstenite::Message;
+            let mut close_message = "connection closed".to_owned();
             while let Some(item) = read.next().await {
                 match item {
                     Ok(Message::Binary(data)) => match WsFrame::decode(&data[..]) {
                         Ok(frame) => match frame.payload {
                             Some(ws_frame::Payload::DbResponse(resp)) => {
                                 let req_id = resp.request_id.clone();
-                                let tx_opt = pending_clone
-                                    .lock()
-                                    .ok()
-                                    .and_then(|mut pending| pending.remove(&req_id));
+                                let tx_opt = lock_pending_requests(&pending_clone).remove(&req_id);
                                 if let Some(tx) = tx_opt {
                                     let result = if resp.status == "ok" {
                                         Ok(resp)
@@ -422,11 +426,12 @@ impl WebSocketTransport {
                     }
                     Err(e) => {
                         log_debug!("read_loop: read error err={}", e);
+                        close_message = format!("websocket read failed: {e}");
                         break;
                     }
                 }
             }
-            fail_pending_requests(&pending_clone, "connection closed");
+            fail_pending_requests(&pending_clone, &close_message);
             log_debug!("read_loop: terminated");
         });
 
@@ -481,10 +486,7 @@ impl WebSocketTransport {
         // Prepare oneshot before sending
         let (tx, rx) = oneshot::channel::<PendingResponse>();
         {
-            let mut pending = self
-                .pending
-                .lock()
-                .map_err(|_| SdkError::DatabaseError("pending request lock poisoned".into()))?;
+            let mut pending = lock_pending_requests(&self.pending);
             if pending.contains_key(&request_id) {
                 return Err(SdkError::ValidationError(format!(
                     "duplicate request id {request_id}"
@@ -1173,6 +1175,20 @@ mod hash_backed_change_request_tests {
     use encrypted_spaces_changelog_core::changelog::{HashedValues, OpType, ROOT_TREE_PATH};
     use encrypted_spaces_storage_encoding::hashstore_hash;
 
+    fn poison_pending_map(pending: &NativePendingMap) {
+        let poisoned = std::sync::Arc::clone(pending);
+        let result = std::thread::spawn(move || {
+            let _guard = poisoned.lock().expect("pending lock before poison");
+            panic!("poison pending request map");
+        })
+        .join();
+        assert!(result.is_err(), "poisoning thread did not panic");
+        assert!(
+            pending.is_poisoned(),
+            "pending request map was not poisoned"
+        );
+    }
+
     #[test]
     fn hash_backed_change_request_proto_carries_material() {
         let mut change = Change::new(
@@ -1223,6 +1239,171 @@ mod hash_backed_change_request_tests {
 
         assert!(error.to_string().contains("timed out"));
         assert!(pending.lock().expect("pending lock").is_empty());
+    }
+
+    #[test]
+    fn pending_request_guard_cleans_up_after_lock_poison() {
+        let pending = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+        pending
+            .lock()
+            .expect("pending lock")
+            .insert("poisoned-request".to_owned(), response_tx);
+        poison_pending_map(&pending);
+
+        drop(PendingRequestGuard::new(
+            "poisoned-request".to_owned(),
+            std::sync::Arc::clone(&pending),
+        ));
+
+        let recovered = pending.lock().unwrap_or_else(|error| error.into_inner());
+        assert!(
+            recovered.is_empty(),
+            "guard left a stale request in a poisoned pending map"
+        );
+        assert!(!pending.is_poisoned(), "guard did not clear lock poison");
+    }
+
+    #[test]
+    fn fail_pending_requests_drains_after_lock_poison() {
+        let pending = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let (response_tx, mut response_rx) = tokio::sync::oneshot::channel();
+        pending
+            .lock()
+            .expect("pending lock")
+            .insert("poisoned-request".to_owned(), response_tx);
+        poison_pending_map(&pending);
+
+        fail_pending_requests(&pending, "connection failed");
+
+        let PendingResponse::Db(result) = response_rx
+            .try_recv()
+            .expect("pending caller was not failed after lock poison");
+        let error = result.expect_err("pending caller unexpectedly succeeded");
+        assert!(error.to_string().contains("connection failed"));
+        let recovered = pending.lock().unwrap_or_else(|error| error.into_inner());
+        assert!(recovered.is_empty(), "failed requests were not drained");
+        assert!(
+            !pending.is_poisoned(),
+            "failure path did not clear lock poison"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_read_loop_routes_response_after_lock_poison() {
+        use futures_util::SinkExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind websocket listener");
+        let address = listener.local_addr().expect("listener address");
+        let (send_response, receive_response) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept websocket");
+            let mut websocket = async_tungstenite::tokio::accept_async(stream)
+                .await
+                .expect("accept websocket handshake");
+            receive_response.await.expect("response signal");
+            let response = DbResponse {
+                request_id: "poisoned-request".to_owned(),
+                status: "ok".to_owned(),
+                error: String::new(),
+                result: None,
+            };
+            websocket
+                .send(async_tungstenite::tungstenite::Message::Binary(
+                    WsFrame {
+                        payload: Some(ws_frame::Payload::DbResponse(response)),
+                    }
+                    .encode_to_vec(),
+                ))
+                .await
+                .expect("send websocket response");
+        });
+
+        let transport = WebSocketTransport::new_with_request_timeout(
+            &format!("ws://{address}/ws"),
+            std::time::Duration::from_secs(2),
+        )
+        .await
+        .expect("create websocket transport");
+        transport
+            .authenticate(&AuthContext::anonymous(
+                encrypted_spaces_backend::SpaceId::random(),
+            ))
+            .await
+            .expect("authenticate websocket transport");
+
+        poison_pending_map(&transport.pending);
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        transport
+            .pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert("poisoned-request".to_owned(), response_tx);
+        send_response.send(()).expect("signal websocket response");
+
+        let response = tokio::time::timeout(std::time::Duration::from_secs(1), response_rx)
+            .await
+            .expect("read loop dropped response after lock poison")
+            .expect("pending response channel closed");
+        let PendingResponse::Db(result) = response;
+        assert_eq!(
+            result.expect("response routing failed").request_id,
+            "poisoned-request"
+        );
+        assert!(
+            !transport.pending.is_poisoned(),
+            "response routing did not clear lock poison"
+        );
+        server.await.expect("websocket server task");
+    }
+
+    #[tokio::test]
+    async fn native_read_error_preserves_cause_for_pending_request() {
+        use futures_util::StreamExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind websocket listener");
+        let address = listener.local_addr().expect("listener address");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept websocket");
+            let mut websocket = async_tungstenite::tokio::accept_async(stream)
+                .await
+                .expect("accept websocket handshake");
+            websocket
+                .next()
+                .await
+                .expect("client request frame")
+                .expect("valid client request frame");
+            drop(websocket);
+        });
+
+        let transport = WebSocketTransport::new_with_request_timeout(
+            &format!("ws://{address}/ws"),
+            std::time::Duration::from_secs(2),
+        )
+        .await
+        .expect("create websocket transport");
+        transport
+            .authenticate(&AuthContext::anonymous(
+                encrypted_spaces_backend::SpaceId::random(),
+            ))
+            .await
+            .expect("authenticate websocket transport");
+
+        let error = transport
+            .fast_forward(0)
+            .await
+            .expect_err("abrupt websocket reset unexpectedly succeeded");
+        let message = error.to_string();
+        assert!(
+            message.contains("websocket read failed:"),
+            "read cause was discarded: {message}"
+        );
+        assert_ne!(message, "Database error: connection closed");
+        server.await.expect("websocket server task");
     }
 
     #[tokio::test]
