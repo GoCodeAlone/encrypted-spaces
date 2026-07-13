@@ -11,12 +11,17 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::fs;
+use std::future::Future;
 use std::io;
+use std::time::Duration;
 
-const ACTOR_ID_ENV: &str = "ENCRYPTED_SPACES_ACTOR_ID";
+const CLIENT_LABEL_ENV: &str = "ENCRYPTED_SPACES_CLIENT_LABEL";
 const SCHEMA_PATH_ENV: &str = "ENCRYPTED_SPACES_SCHEMA_PATH";
 const BACKEND_URL_ENV: &str = "ENCRYPTED_SPACES_BACKEND_URL";
+const REQUEST_TIMEOUT_MS_ENV: &str = "ENCRYPTED_SPACES_REQUEST_TIMEOUT_MS";
 const DEFAULT_BACKEND_URL: &str = "ws://127.0.0.1:8080/ws";
+const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 30_000;
+const MAX_REQUEST_TIMEOUT_MS: u64 = 3_600_000;
 
 pub struct Runtime {
     executor: tokio::runtime::Runtime,
@@ -26,19 +31,20 @@ pub struct Runtime {
 }
 
 struct ProcessConfig {
-    actor_id: String,
+    client_label: String,
     schema_sha256: String,
     schema: Vec<u8>,
     data_commitment_bytes: [u8; 32],
     data_commitment: String,
     ff_guest_image_id: [u32; 8],
     backend_url: String,
+    request_timeout: Duration,
 }
 
 #[derive(Serialize)]
 struct HelloResult<'a> {
     protocol_version: u16,
-    actor_id: &'a str,
+    client_label: &'a str,
     schema_sha256: &'a str,
     data_commitment: &'a str,
     ff_guest_image_id: [u32; 8],
@@ -125,6 +131,7 @@ enum RefKind {
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ScopedRef {
+    space_id: String,
     kind: RefKind,
     table: String,
     row_id: i64,
@@ -323,7 +330,7 @@ struct ShutdownResult {
 
 impl Runtime {
     pub fn from_env() -> io::Result<Self> {
-        let actor_id = required_env(ACTOR_ID_ENV)?;
+        let client_label = required_env(CLIENT_LABEL_ENV)?;
         let schema_path = required_env(SCHEMA_PATH_ENV)?;
         let schema = fs::read(&schema_path)?;
         let schema_sha256 = format!("{:x}", Sha256::digest(&schema));
@@ -345,17 +352,19 @@ impl Runtime {
             .ok()
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| DEFAULT_BACKEND_URL.to_owned());
+        let request_timeout = request_timeout_from_env()?;
 
         Ok(Self {
             executor,
             process: ProcessConfig {
-                actor_id,
+                client_label,
                 schema_sha256,
                 schema,
                 data_commitment_bytes,
                 data_commitment,
                 ff_guest_image_id: encrypted_spaces_ffproof::EXTEND_FF_ID,
                 backend_url,
+                request_timeout,
             },
             space: None,
             shutdown_requested: false,
@@ -369,7 +378,7 @@ impl Runtime {
                 request.request_id,
                 HelloResult {
                     protocol_version: PROTOCOL_VERSION,
-                    actor_id: &self.process.actor_id,
+                    client_label: &self.process.client_label,
                     schema_sha256: &self.process.schema_sha256,
                     data_commitment: &self.process.data_commitment,
                     ff_guest_image_id: self.process.ff_guest_image_id,
@@ -419,9 +428,11 @@ impl Runtime {
             return invalid_state(request_id);
         }
         let backend_url = self.process.backend_url.clone();
+        let request_timeout = self.process.request_timeout;
         let schema = self.application_schema();
         let space = match self.executor.block_on(async move {
-            let transport = WebSocketTransport::new(&backend_url).await?;
+            let transport =
+                WebSocketTransport::new_with_request_timeout(&backend_url, request_timeout).await?;
             Space::create(transport, schema).await
         }) {
             Ok(space) => space,
@@ -450,6 +461,9 @@ impl Runtime {
         if payload.space_id != space_id {
             return invalid_state(request_id);
         }
+        if let Err(response) = self.sync_before_access(&request_id) {
+            return response;
+        }
         match self.executor.block_on(space.snapshot()) {
             Ok(snapshot) => Response::success(request_id, SnapshotResult { space_id, snapshot }),
             Err(error) => sdk_operation_error(request_id, &error),
@@ -465,11 +479,19 @@ impl Runtime {
             return invalid_state(request_id);
         }
         let backend_url = self.process.backend_url.clone();
+        let request_timeout = self.process.request_timeout;
+        let schema = self.application_schema();
         let space = match self.executor.block_on(async move {
-            let transport = WebSocketTransport::new(&backend_url).await?;
-            Space::restore(transport, payload.snapshot).await
+            let transport =
+                WebSocketTransport::new_with_request_timeout(&backend_url, request_timeout).await?;
+            Space::restore_trusted(transport, payload.snapshot, schema).await
         }) {
             Ok(space) => space,
+            Err(SdkErrorType::ValidationError(message))
+                if message == "snapshot trust bundle mismatch" =>
+            {
+                return trust_mismatch(request_id);
+            }
             Err(_) => return sdk_error(request_id),
         };
         let space_id = space.id().to_string();
@@ -510,6 +532,27 @@ impl Runtime {
         }
     }
 
+    pub fn subscribe_updates(
+        &self,
+        space_id: &str,
+    ) -> Option<tokio::sync::broadcast::Receiver<encrypted_spaces_sdk::BroadcastEvent>> {
+        let space = self.space.as_ref()?;
+        (space_id == space.id().to_string()).then(|| space.subscribe_updates())
+    }
+
+    pub fn poll_background(&self) {
+        self.executor.block_on(tokio::task::yield_now());
+    }
+
+    fn sync_before_access(&self, request_id: &str) -> Result<(), Response> {
+        let Some(space) = self.space.as_ref() else {
+            return Err(invalid_state(request_id.to_owned()));
+        };
+        self.executor
+            .block_on(space.sync())
+            .map_err(|error| sdk_operation_error(request_id.to_owned(), &error))
+    }
+
     fn table_insert(&mut self, request_id: String, payload: Value) -> Response {
         let payload = match parse_payload::<TableInsertPayload>(&request_id, payload) {
             Ok(payload) if payload.row.is_object() => payload,
@@ -522,11 +565,11 @@ impl Runtime {
         if payload.space_id != space.id().to_string() {
             return invalid_state(request_id);
         }
+        if let Err(response) = self.sync_before_access(&request_id) {
+            return response;
+        }
         let table = space.table::<Value>(&payload.table);
-        match self.executor.block_on(async {
-            space.sync().await?;
-            table.insert(&payload.row).execute().await
-        }) {
+        match self.executor.block_on(table.insert(&payload.row).execute()) {
             Ok(row_id) => Response::success(request_id, TableInsertResult { row_id }),
             Err(error) => sdk_operation_error(request_id, &error),
         }
@@ -559,11 +602,14 @@ impl Runtime {
         {
             return invalid_request(request_id);
         }
+        if let Err(response) = self.sync_before_access(&request_id) {
+            return response;
+        }
         let table = space.table::<Value>(&payload.table);
-        match self.executor.block_on(async {
-            space.sync().await?;
-            table.select().where_eq(&column, value).all().await
-        }) {
+        match self
+            .executor
+            .block_on(table.select().where_eq(&column, value).all())
+        {
             Ok(rows) => Response::success(request_id, TableSelectResult { rows }),
             Err(error) => sdk_operation_error(request_id, &error),
         }
@@ -588,11 +634,15 @@ impl Runtime {
         if payload.space_id != space_id {
             return invalid_state(request_id);
         }
+        if let Err(response) = self.sync_before_access(&request_id) {
+            return response;
+        }
         let list = space.list::<Value>(&payload.table, payload.row_id, &payload.column);
         if self.executor.block_on(list.get_all()).is_err() {
             return sdk_error(request_id);
         }
         let list_ref = match encode_opaque_ref(&ScopedRef {
+            space_id: space_id.clone(),
             kind: RefKind::List,
             table: payload.table.clone(),
             row_id: payload.row_id,
@@ -626,8 +676,11 @@ impl Runtime {
             return invalid_state(request_id);
         };
         let space_id = space.id().to_string();
-        if payload.space_id != space_id {
+        if payload.space_id != space_id || list_ref.space_id != space_id {
             return invalid_state(request_id);
+        }
+        if let Err(response) = self.sync_before_access(&request_id) {
+            return response;
         }
         let list = space.list::<Value>(&list_ref.table, list_ref.row_id, &list_ref.column);
         match self.executor.block_on(list.append(&payload.value)) {
@@ -656,8 +709,11 @@ impl Runtime {
             return invalid_state(request_id);
         };
         let space_id = space.id().to_string();
-        if payload.space_id != space_id {
+        if payload.space_id != space_id || list_ref.space_id != space_id {
             return invalid_state(request_id);
+        }
+        if let Err(response) = self.sync_before_access(&request_id) {
+            return response;
         }
         let list = space.list::<Value>(&list_ref.table, list_ref.row_id, &list_ref.column);
         match self.executor.block_on(list.get_all()) {
@@ -699,11 +755,15 @@ impl Runtime {
         if payload.space_id != space_id {
             return invalid_state(request_id);
         }
+        if let Err(response) = self.sync_before_access(&request_id) {
+            return response;
+        }
         let text = space.textarea(&payload.table, payload.row_id, &payload.column);
         if self.executor.block_on(text.sync()).is_err() {
             return sdk_error(request_id);
         }
         let text_ref = match encode_opaque_ref(&ScopedRef {
+            space_id: space_id.clone(),
             kind: RefKind::Text,
             table: payload.table.clone(),
             row_id: payload.row_id,
@@ -740,22 +800,31 @@ impl Runtime {
             return invalid_state(request_id);
         };
         let space_id = space.id().to_string();
-        if payload.space_id != space_id {
+        if payload.space_id != space_id || text_ref.space_id != space_id {
             return invalid_state(request_id);
         }
+        if let Err(response) = self.sync_before_access(&request_id) {
+            return response;
+        }
         let text = space.textarea(&text_ref.table, text_ref.row_id, &text_ref.column);
-        let result = self.executor.block_on(async {
+        let text_len = match self.executor.block_on(async {
             text.sync().await?;
-            if payload.delete_count > 0 {
-                text.delete_range(payload.position, delete_end).await?;
-            }
-            if !payload.insert.is_empty() {
-                text.insert_string(payload.position, &payload.insert)
-                    .await?;
-            }
-            encrypted_spaces_sdk::SdkResult::Ok(())
-        });
-        match result {
+            text.len().await
+        }) {
+            Ok(text_len) => text_len,
+            Err(error) => return sdk_operation_error(request_id, &error),
+        };
+        if payload.position > text_len || delete_end > text_len {
+            return invalid_request(request_id);
+        }
+        let mutation = self.executor.block_on(apply_text_mutation(
+            request_id.clone(),
+            payload.delete_count > 0,
+            text.delete_range(payload.position, delete_end),
+            !payload.insert.is_empty(),
+            text.insert_string(payload.position, &payload.insert),
+        ));
+        match mutation {
             Ok(()) => Response::success(
                 request_id,
                 TextEditResult {
@@ -764,7 +833,7 @@ impl Runtime {
                     edited: true,
                 },
             ),
-            Err(_) => sdk_error(request_id),
+            Err(response) => response,
         }
     }
 
@@ -781,8 +850,11 @@ impl Runtime {
             return invalid_state(request_id);
         };
         let space_id = space.id().to_string();
-        if payload.space_id != space_id {
+        if payload.space_id != space_id || text_ref.space_id != space_id {
             return invalid_state(request_id);
+        }
+        if let Err(response) = self.sync_before_access(&request_id) {
+            return response;
         }
         let text = space.textarea(&text_ref.table, text_ref.row_id, &text_ref.column);
         match self.executor.block_on(text.snapshot()) {
@@ -813,6 +885,9 @@ impl Runtime {
         let space_id = space.id().to_string();
         if payload.space_id != space_id {
             return invalid_state(request_id);
+        }
+        if let Err(response) = self.sync_before_access(&request_id) {
+            return response;
         }
         match self
             .executor
@@ -845,6 +920,9 @@ impl Runtime {
         if payload.space_id != space_id {
             return invalid_state(request_id);
         }
+        if let Err(response) = self.sync_before_access(&request_id) {
+            return response;
+        }
         match self.executor.block_on(
             space
                 .file()
@@ -876,6 +954,9 @@ impl Runtime {
         let space_id = space.id().to_string();
         if payload.space_id != space_id {
             return invalid_state(request_id);
+        }
+        if let Err(response) = self.sync_before_access(&request_id) {
+            return response;
         }
         match self.executor.block_on(space.invite_user()) {
             Ok(invite) => {
@@ -911,9 +992,11 @@ impl Runtime {
             Err(()) => return invalid_request(request_id),
         };
         let backend_url = self.process.backend_url.clone();
+        let request_timeout = self.process.request_timeout;
         let schema = self.application_schema();
         let space = match self.executor.block_on(async move {
-            let transport = WebSocketTransport::new(&backend_url).await?;
+            let transport =
+                WebSocketTransport::new_with_request_timeout(&backend_url, request_timeout).await?;
             Space::join(transport, invite, schema).await
         }) {
             Ok(space) => space,
@@ -946,6 +1029,9 @@ impl Runtime {
         let space_id = space.id().to_string();
         if payload.space_id != space_id {
             return invalid_state(request_id);
+        }
+        if let Err(response) = self.sync_before_access(&request_id) {
+            return response;
         }
         match self.executor.block_on(space.remove_user(payload.member_id)) {
             Ok(()) => Response::success(
@@ -1030,6 +1116,13 @@ fn sdk_error(request_id: String) -> Response {
 }
 
 fn sdk_operation_error(request_id: String, error: &SdkErrorType) -> Response {
+    if matches!(error, SdkErrorType::CommitOutcomeUnknown(_)) {
+        return Response::error(
+            Some(request_id),
+            "COMMIT_UNKNOWN",
+            "operation outcome is unknown; synchronize before retrying",
+        );
+    }
     let removed_member = matches!(
         error,
         SdkErrorType::ValidationError(message)
@@ -1062,6 +1155,50 @@ fn internal_error(request_id: String) -> Response {
     )
 }
 
+fn text_mutation_error(request_id: String) -> Response {
+    Response::error(
+        Some(request_id),
+        "PARTIAL_COMMIT",
+        "text edit may have partially committed; synchronize before continuing",
+    )
+}
+
+async fn apply_text_mutation<D, I>(
+    request_id: String,
+    run_delete: bool,
+    delete: D,
+    run_insert: bool,
+    insert: I,
+) -> Result<(), Response>
+where
+    D: Future<Output = Result<(), SdkErrorType>>,
+    I: Future<Output = Result<(), SdkErrorType>>,
+{
+    if run_delete {
+        if let Err(error) = delete.await {
+            return Err(sdk_operation_error(request_id, &error));
+        }
+    }
+    if run_insert {
+        if let Err(error) = insert.await {
+            return Err(if run_delete {
+                text_mutation_error(request_id)
+            } else {
+                sdk_operation_error(request_id, &error)
+            });
+        }
+    }
+    Ok(())
+}
+
+fn trust_mismatch(request_id: String) -> Response {
+    Response::error(
+        Some(request_id),
+        "TRUST_MISMATCH",
+        "snapshot trust bundle does not match process configuration",
+    )
+}
+
 fn encode_opaque_ref(value: &impl Serialize) -> Result<String, ()> {
     serde_json::to_vec(value)
         .map(|bytes| URL_SAFE_NO_PAD.encode(bytes))
@@ -1084,11 +1221,171 @@ fn required_env(name: &str) -> io::Result<String> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, format!("{name} is required")))
 }
 
+fn request_timeout_from_env() -> io::Result<Duration> {
+    match std::env::var(REQUEST_TIMEOUT_MS_ENV) {
+        Ok(value) => parse_request_timeout_ms(Some(&value)),
+        Err(std::env::VarError::NotPresent) => parse_request_timeout_ms(None),
+        Err(error) => Err(io::Error::new(io::ErrorKind::InvalidInput, error)),
+    }
+}
+
+fn parse_request_timeout_ms(value: Option<&str>) -> io::Result<Duration> {
+    let milliseconds = match value {
+        Some(value) => value.parse::<u64>().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{REQUEST_TIMEOUT_MS_ENV} must be an integer"),
+            )
+        })?,
+        None => DEFAULT_REQUEST_TIMEOUT_MS,
+    };
+    if !(1..=MAX_REQUEST_TIMEOUT_MS).contains(&milliseconds) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{REQUEST_TIMEOUT_MS_ENV} must be between 1 and {MAX_REQUEST_TIMEOUT_MS}"),
+        ));
+    }
+    Ok(Duration::from_millis(milliseconds))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use encrypted_spaces_sdk::{ColumnType, SchemaBuilder};
     use serde_json::json;
+
+    #[test]
+    fn text_edit_failure_after_mutation_is_reported_as_partial_commit() {
+        #[derive(Serialize)]
+        struct TextRow {
+            id: Option<i64>,
+            body: encrypted_spaces_sdk::TextArea,
+        }
+
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        executor.block_on(async {
+            let schema = SchemaBuilder::new("text_records")
+                .column("id", ColumnType::Integer)
+                .plaintext_primary_key()
+                .column("body", ColumnType::List)
+                .expect("body column")
+                .build()
+                .expect("text schema");
+            let transport = LocalTransport::new(std::slice::from_ref(&schema), None, Some(1024))
+                .await
+                .expect("local transport");
+            let data_commitment = transport.get_root_hash().await.expect("initial root");
+            let space = Space::create(
+                transport,
+                ApplicationSchema::WithDataCommitment(
+                    vec![schema],
+                    data_commitment,
+                    encrypted_spaces_ffproof::EXTEND_FF_ID,
+                ),
+            )
+            .await
+            .expect("text space");
+            let row_id = space
+                .table::<TextRow>("text_records")
+                .insert(&TextRow {
+                    id: None,
+                    body: encrypted_spaces_sdk::TextArea::empty(),
+                })
+                .execute()
+                .await
+                .expect("text parent row");
+            let text = space.textarea("text_records", row_id, "body");
+            text.insert_string(0, "abcdef").await.expect("initial text");
+
+            let result = apply_text_mutation(
+                "partial-text-edit".to_owned(),
+                true,
+                text.delete_range(1, 3),
+                true,
+                std::future::ready(encrypted_spaces_sdk::SdkResult::Err(SdkErrorType::NotFound)),
+            )
+            .await;
+            let response = result.expect_err("insert failure after delete must be partial commit");
+
+            assert!(!response.ok);
+            assert_eq!(
+                response.error.as_ref().map(|error| error.code),
+                Some("PARTIAL_COMMIT")
+            );
+            assert_eq!(
+                text.snapshot().await.expect("partially committed text"),
+                "adef"
+            );
+        });
+    }
+
+    #[test]
+    fn text_edit_first_stage_access_denial_is_preserved() {
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let result = executor.block_on(apply_text_mutation(
+            "denied-text-edit".to_owned(),
+            true,
+            std::future::ready(encrypted_spaces_sdk::SdkResult::Err(
+                SdkErrorType::AccessDenied("revoked".to_owned()),
+            )),
+            true,
+            std::future::ready(encrypted_spaces_sdk::SdkResult::Ok(())),
+        ));
+        let response = result.expect_err("access denial must fail the edit");
+
+        assert_eq!(
+            response.error.as_ref().map(|error| error.code),
+            Some("ACCESS_DENIED")
+        );
+    }
+
+    #[test]
+    fn sdk_commit_outcome_unknown_is_preserved() {
+        let response = sdk_operation_error(
+            "unknown-commit".to_owned(),
+            &SdkErrorType::CommitOutcomeUnknown("deadline after send".to_owned()),
+        );
+
+        assert_eq!(
+            response.error.as_ref().map(|error| error.code),
+            Some("COMMIT_UNKNOWN")
+        );
+        assert!(
+            response
+                .error
+                .as_ref()
+                .is_some_and(|error| error.message.contains("synchronize")),
+            "unknown commit response omitted reconciliation guidance"
+        );
+    }
+
+    #[test]
+    fn request_timeout_bounds_are_enforced() {
+        assert_eq!(
+            parse_request_timeout_ms(None).expect("default timeout"),
+            Duration::from_millis(DEFAULT_REQUEST_TIMEOUT_MS)
+        );
+        assert_eq!(
+            parse_request_timeout_ms(Some("1")).expect("minimum timeout"),
+            Duration::from_millis(1)
+        );
+        assert_eq!(
+            parse_request_timeout_ms(Some("3600000")).expect("maximum timeout"),
+            Duration::from_millis(MAX_REQUEST_TIMEOUT_MS)
+        );
+        for invalid in ["0", "3600001", "not-a-number"] {
+            assert!(
+                parse_request_timeout_ms(Some(invalid)).is_err(),
+                "accepted invalid timeout {invalid}"
+            );
+        }
+    }
 
     fn revoked_member_runtime() -> (Runtime, String, i64) {
         let executor = tokio::runtime::Builder::new_current_thread()
@@ -1150,13 +1447,14 @@ mod tests {
         let runtime = Runtime {
             executor,
             process: ProcessConfig {
-                actor_id: "revoked-member".to_owned(),
+                client_label: "revoked-member".to_owned(),
                 schema_sha256: "test-schema".to_owned(),
                 schema: Vec::new(),
                 data_commitment_bytes,
                 data_commitment,
                 ff_guest_image_id: encrypted_spaces_ffproof::EXTEND_FF_ID,
                 backend_url: "local-test".to_owned(),
+                request_timeout: Duration::from_millis(DEFAULT_REQUEST_TIMEOUT_MS),
             },
             space: Some(member),
             shutdown_requested: false,
@@ -1203,5 +1501,95 @@ mod tests {
             response.error.as_ref().map(|error| error.code),
             Some("ACCESS_DENIED")
         );
+    }
+
+    #[test]
+    fn every_protected_operation_syncs_revocation_before_sdk_access() {
+        let operations = [
+            "snapshot",
+            "list.create",
+            "list.append",
+            "list.read",
+            "text.create",
+            "text.edit",
+            "text.read",
+            "file.put",
+            "file.get",
+            "member.invite",
+            "member.remove",
+        ];
+
+        for operation in operations {
+            let (mut runtime, space_id, row_id) = revoked_member_runtime();
+            let list_ref = encode_opaque_ref(&ScopedRef {
+                space_id: space_id.clone(),
+                kind: RefKind::List,
+                table: "records".to_owned(),
+                row_id,
+                column: "label".to_owned(),
+            })
+            .expect("list reference");
+            let text_ref = encode_opaque_ref(&ScopedRef {
+                space_id: space_id.clone(),
+                kind: RefKind::Text,
+                table: "records".to_owned(),
+                row_id,
+                column: "label".to_owned(),
+            })
+            .expect("text reference");
+            let response = match operation {
+                "snapshot" => runtime.snapshot(
+                    "revoked-snapshot".to_owned(),
+                    json!({"space_id": space_id}),
+                ),
+                "list.create" => runtime.list_create(
+                    "revoked-list-create".to_owned(),
+                    json!({"space_id": space_id, "table": "records", "row_id": row_id, "column": "label"}),
+                ),
+                "list.append" => runtime.list_append(
+                    "revoked-list-append".to_owned(),
+                    json!({"space_id": space_id, "list_ref": list_ref, "value": "denied"}),
+                ),
+                "list.read" => runtime.list_read(
+                    "revoked-list-read".to_owned(),
+                    json!({"space_id": space_id, "list_ref": list_ref}),
+                ),
+                "text.create" => runtime.text_create(
+                    "revoked-text-create".to_owned(),
+                    json!({"space_id": space_id, "table": "records", "row_id": row_id, "column": "label"}),
+                ),
+                "text.edit" => runtime.text_edit(
+                    "revoked-text-edit".to_owned(),
+                    json!({"space_id": space_id, "text_ref": text_ref, "position": 0, "delete_count": 0, "insert": "denied"}),
+                ),
+                "text.read" => runtime.text_read(
+                    "revoked-text-read".to_owned(),
+                    json!({"space_id": space_id, "text_ref": text_ref}),
+                ),
+                "file.put" => runtime.file_put(
+                    "revoked-file-put".to_owned(),
+                    json!({"space_id": space_id, "bytes_base64": "ZGVuaWVk"}),
+                ),
+                "file.get" => runtime.file_get(
+                    "revoked-file-get".to_owned(),
+                    json!({"space_id": space_id, "digest": "0".repeat(64)}),
+                ),
+                "member.invite" => runtime.member_invite(
+                    "revoked-member-invite".to_owned(),
+                    json!({"space_id": space_id}),
+                ),
+                "member.remove" => runtime.member_remove(
+                    "revoked-member-remove".to_owned(),
+                    json!({"space_id": space_id, "member_id": 1}),
+                ),
+                _ => unreachable!(),
+            };
+
+            assert_eq!(
+                response.error.as_ref().map(|error| error.code),
+                Some("ACCESS_DENIED"),
+                "{operation} did not observe revocation before SDK access"
+            );
+        }
     }
 }

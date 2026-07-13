@@ -1284,15 +1284,22 @@ impl Space {
                     "[SDK] handle_broadcast: FastForwardRequired reason={}",
                     reason
                 );
-                let _ = self.recover_via_fast_forward().await;
-                let (cid, clc) = self
+                let recovery = self.recover_via_fast_forward().await;
+                let (recovered_cid, clc) = self
                     .with_state(|state| (state.current_change_id, state.current_clc_state.root));
                 log::debug!(
                     "[SDK] handle_broadcast: after FF recovery change_id={} clc={}",
-                    cid,
+                    recovered_cid,
                     hex::encode::<[u8; 32]>(clc.into())
                 );
-                BroadcastApplyOutcome::Skipped
+                match recovery {
+                    Ok(()) if recovered_cid > cid => BroadcastApplyOutcome::AppliedCacheInvalidated,
+                    Ok(()) => BroadcastApplyOutcome::Skipped,
+                    Err(error) => {
+                        log::warn!("[SDK] handle_broadcast: FF recovery failed: {error}");
+                        BroadcastApplyOutcome::Skipped
+                    }
+                }
             }
             Err(ref e) => {
                 log::warn!("[SDK] handle_broadcast: error={}", e);
@@ -4771,7 +4778,7 @@ mod issue212_completion_tests {
     use std::any::Any;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     #[derive(Debug, Serialize, Deserialize)]
     struct Note {
@@ -4789,19 +4796,41 @@ mod issue212_completion_tests {
     struct AckSkewTransport {
         inner: LocalTransport,
         skew_armed: Arc<AtomicBool>,
+        last_submission: Arc<Mutex<Option<(Change, ChangeResponse)>>>,
+        broadcast_tx: tokio::sync::broadcast::Sender<crate::websocket_transport::BroadcastEvent>,
     }
 
     impl AckSkewTransport {
         fn new(inner: LocalTransport) -> Self {
+            let (broadcast_tx, _) = tokio::sync::broadcast::channel(16);
             Self {
                 inner,
                 skew_armed: Arc::new(AtomicBool::new(false)),
+                last_submission: Arc::new(Mutex::new(None)),
+                broadcast_tx,
             }
         }
 
         /// Arm exactly one upcoming `submit_change` to misreport its change_id.
         fn arm(&self) {
             self.skew_armed.store(true, Ordering::SeqCst);
+        }
+
+        fn take_last_submission(&self) -> (Change, ChangeResponse) {
+            self.last_submission
+                .lock()
+                .expect("last submission lock")
+                .take()
+                .expect("captured submission")
+        }
+
+        fn broadcast(&self, change: Change, change_response: ChangeResponse) {
+            self.broadcast_tx
+                .send(crate::websocket_transport::BroadcastEvent {
+                    change,
+                    change_response,
+                })
+                .expect("SDK listener is subscribed");
         }
     }
 
@@ -4813,6 +4842,8 @@ mod issue212_completion_tests {
             retention_proofs: Vec<Vec<u8>>,
         ) -> Result<ChangeResponse> {
             let mut resp = self.inner.submit_change(change, retention_proofs).await?;
+            *self.last_submission.lock().expect("last submission lock") =
+                Some((change.clone(), resp.clone()));
             if self.skew_armed.swap(false, Ordering::SeqCst) {
                 // Claim a later position than the one actually assigned, so a
                 // fast-forward cannot prove the exact entry at `resp.change_id`.
@@ -4895,7 +4926,7 @@ mod issue212_completion_tests {
         }
 
         fn subscribe_broadcasts(&self) -> Result<BroadcastReceiver> {
-            self.inner.subscribe_broadcasts()
+            Ok(self.broadcast_tx.subscribe())
         }
 
         async fn file_upload(&self, hash: &str, data: Vec<u8>) -> Result<()> {
@@ -4945,6 +4976,31 @@ mod issue212_completion_tests {
             .await
             .expect("add_action");
         (transport, space)
+    }
+
+    #[tokio::test]
+    async fn stale_broadcast_is_not_published_by_the_sdk_listener() {
+        let (transport, space) = make_space().await;
+        let mut updates = space.subscribe_updates();
+        space
+            .table::<Note>("notes")
+            .insert(&Note {
+                id: None,
+                title: "already applied".to_owned(),
+            })
+            .execute()
+            .await
+            .expect("insert note");
+        let (change, change_response) = transport.take_last_submission();
+
+        transport.broadcast(change, change_response);
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), updates.recv())
+                .await
+                .is_err(),
+            "stale broadcast was published as a fresh SDK update"
+        );
     }
 
     fn assert_failed_closed<T: std::fmt::Debug>(res: Result<T>) {

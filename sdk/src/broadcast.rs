@@ -46,9 +46,11 @@ pub(crate) fn start_listener(space: &Space) {
                         serialize_mutations: Arc::clone(&serialize_mutations),
                         ff_in_progress: Arc::clone(&ff_in_progress),
                     };
-                    space.handle_broadcast(evt.clone()).await;
+                    let applied = space.handle_broadcast(evt.clone()).await;
                     drop(space);
-                    let _ = updates_tx.send(evt);
+                    if applied {
+                        let _ = updates_tx.send(evt);
+                    }
                 }
                 Err(RecvError::Closed) => break,
                 Err(RecvError::Lagged(n)) => log::warn!("broadcast listener lagged by {n}"),
@@ -61,7 +63,7 @@ impl Space {
     /// Drive a broadcast event through the SDK pipeline: delegate the
     /// changelog-side apply to [`Space::apply_broadcast_change`], then
     /// update caches and run the post-apply delivery-slot recovery.
-    pub(crate) async fn handle_broadcast(&self, evt: BroadcastEvent) {
+    pub(crate) async fn handle_broadcast(&self, evt: BroadcastEvent) -> bool {
         let BroadcastEvent {
             change,
             change_response,
@@ -74,7 +76,7 @@ impl Space {
         let needs_slot_check = crate::SpaceKeyManager::op_may_need_delivery(op_type);
 
         match self.apply_broadcast_change(change, change_response).await {
-            BroadcastApplyOutcome::Skipped => return,
+            BroadcastApplyOutcome::Skipped => return false,
             BroadcastApplyOutcome::Applied { change, writes } => {
                 self.apply_broadcast_cache_updates(&change, &writes).await;
             }
@@ -93,6 +95,7 @@ impl Space {
                 e
             );
         }
+        true
     }
 
     pub(crate) async fn apply_broadcast_cache_updates(

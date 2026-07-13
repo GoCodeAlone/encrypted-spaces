@@ -40,18 +40,24 @@ impl BackendProcess {
         let space_root = fixture_root.join("spaces");
         fs::create_dir_all(&space_root).expect("create backend fixture root");
         fs::write(&schema_path, schema).expect("write backend schema fixture");
-        let child = Command::new(backend_binary())
-            .args([
-                "--schema",
-                schema_path.to_str().expect("schema path is UTF-8"),
-                "--space-root",
-                space_root.to_str().expect("space root is UTF-8"),
-                "--bind-addr",
-                "127.0.0.1",
-                "--port",
-                &port.to_string(),
-            ])
-            .env("RISC0_DEV_MODE", "1")
+        let mut command = Command::new(backend_binary());
+        command.args([
+            "--schema",
+            schema_path.to_str().expect("schema path is UTF-8"),
+            "--space-root",
+            space_root.to_str().expect("space root is UTF-8"),
+            "--bind-addr",
+            "127.0.0.1",
+            "--port",
+            &port.to_string(),
+        ]);
+        if std::env::var_os("ENCRYPTED_SPACES_REQUIRE_REAL_PROOF").is_none() {
+            command.env("RISC0_DEV_MODE", "1");
+        } else {
+            command.env_remove("RISC0_DEV_MODE");
+            command.env_remove("RISC0_SKIP_BUILD");
+        }
+        let child = command
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -184,7 +190,7 @@ impl BridgeProcess {
             .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_encrypted-spaces-bridge")));
         let mut command = Command::new(bridge_binary);
         command
-            .env("ENCRYPTED_SPACES_ACTOR_ID", actor)
+            .env("ENCRYPTED_SPACES_CLIENT_LABEL", actor)
             .env("ENCRYPTED_SPACES_SCHEMA_PATH", &schema_path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped());
@@ -246,6 +252,42 @@ impl BridgeProcess {
         payload: Value,
         actor_override: Option<&str>,
     ) -> Observation {
+        let pending = self.send_inner(operation, payload, actor_override);
+        self.receive(pending, RESPONSE_TIMEOUT)
+    }
+
+    fn send(&mut self, operation: &str, payload: Value) -> PendingObservation {
+        self.send_inner(operation, payload, None)
+    }
+
+    fn send_with_request_id(
+        &mut self,
+        request_id: String,
+        operation: &str,
+        payload: Value,
+    ) -> PendingObservation {
+        let request = json!({
+            "version": PROTOCOL_VERSION,
+            "request_id": request_id,
+            "operation": operation,
+            "payload": payload,
+        });
+        let frame = serde_json::to_string(&request).expect("request JSON");
+        let stdin = self.stdin.as_mut().expect("bridge stdin is open");
+        writeln!(stdin, "{frame}").expect("write bridge frame");
+        stdin.flush().expect("flush bridge frame");
+        PendingObservation {
+            operation: operation.to_owned(),
+            request_id,
+        }
+    }
+
+    fn send_inner(
+        &mut self,
+        operation: &str,
+        payload: Value,
+        actor_override: Option<&str>,
+    ) -> PendingObservation {
         let request_id = format!(
             "runtime-{}-{:02}-{}",
             self.scenario,
@@ -266,24 +308,41 @@ impl BridgeProcess {
         let stdin = self.stdin.as_mut().expect("bridge stdin is open");
         writeln!(stdin, "{frame}").expect("write bridge frame");
         stdin.flush().expect("flush bridge frame");
+        PendingObservation {
+            operation: operation.to_owned(),
+            request_id,
+        }
+    }
 
-        let line = match self.stdout.recv_timeout(RESPONSE_TIMEOUT) {
+    fn receive(&mut self, pending: PendingObservation, timeout: Duration) -> Observation {
+        let line = match self.stdout.recv_timeout(timeout) {
             Ok(StdoutEvent::Line(line)) => line,
-            Ok(StdoutEvent::Eof) => panic!("bridge exited before responding to {operation}"),
+            Ok(StdoutEvent::Eof) => {
+                panic!("bridge exited before responding to {}", pending.operation)
+            }
             Ok(StdoutEvent::Error(error)) => {
-                panic!("bridge stdout read failed while handling {operation}: {error}")
+                panic!(
+                    "bridge stdout read failed while handling {}: {error}",
+                    pending.operation
+                )
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                panic!("bridge did not respond to {operation} within {RESPONSE_TIMEOUT:?}")
+                panic!(
+                    "bridge did not respond to {} within {timeout:?}",
+                    pending.operation
+                )
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                panic!("bridge stdout reader disconnected while handling {operation}")
+                panic!(
+                    "bridge stdout reader disconnected while handling {}",
+                    pending.operation
+                )
             }
         };
         let response = serde_json::from_str(&line).expect("bridge response JSON");
         Observation {
-            operation: operation.to_owned(),
-            request_id,
+            operation: pending.operation,
+            request_id: pending.request_id,
             response,
         }
     }
@@ -345,6 +404,11 @@ struct Observation {
     response: Value,
 }
 
+struct PendingObservation {
+    operation: String,
+    request_id: String,
+}
+
 struct Scenario {
     name: String,
     backend: BackendProcess,
@@ -380,6 +444,26 @@ impl Scenario {
             .get_mut(actor)
             .unwrap_or_else(|| panic!("scenario actor {actor} has no bridge process"))
             .exchange(operation, payload);
+        self.record(observation)
+    }
+
+    fn send(&mut self, actor: &str, operation: &str, payload: Value) -> PendingObservation {
+        self.bridges
+            .get_mut(actor)
+            .unwrap_or_else(|| panic!("scenario actor {actor} has no bridge process"))
+            .send(operation, payload)
+    }
+
+    fn receive(&mut self, actor: &str, pending: PendingObservation, timeout: Duration) -> usize {
+        let observation = self
+            .bridges
+            .get_mut(actor)
+            .unwrap_or_else(|| panic!("scenario actor {actor} has no bridge process"))
+            .receive(pending, timeout);
+        self.record(observation)
+    }
+
+    fn record(&mut self, observation: Observation) -> usize {
         let actual_version = observation.response.get("version").and_then(Value::as_u64);
         if actual_version != Some(PROTOCOL_VERSION) {
             self.failures.push(format!(
@@ -391,7 +475,9 @@ impl Scenario {
             .response
             .get("request_id")
             .and_then(Value::as_str);
-        if actual_request_id != Some(observation.request_id.as_str()) {
+        let uncorrelated_duplicate = actual_request_id.is_none()
+            && observation.response["error"]["code"].as_str() == Some("DUPLICATE_REQUEST_ID");
+        if actual_request_id != Some(observation.request_id.as_str()) && !uncorrelated_duplicate {
             self.failures.push(format!(
                 "{}: request_id {:?}, expected {}",
                 observation.operation, actual_request_id, observation.request_id
@@ -498,10 +584,16 @@ impl Scenario {
 #[derive(Deserialize)]
 struct HelloResult {
     protocol_version: u64,
-    actor_id: String,
+    client_label: String,
     schema_sha256: String,
     data_commitment: String,
     ff_guest_image_id: Vec<u32>,
+}
+
+#[derive(Deserialize)]
+struct VersionResult {
+    version: String,
+    protocol_version: u64,
 }
 
 #[derive(Deserialize)]
@@ -540,6 +632,23 @@ struct JoinResult {
 struct SyncResult {
     space_id: String,
     synced: bool,
+    #[serde(default)]
+    wait_trigger: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CancelResult {
+    canceled: bool,
+}
+
+#[derive(Deserialize)]
+struct CloseResult {
+    closed: bool,
+}
+
+#[derive(Deserialize)]
+struct ShutdownResult {
+    shutting_down: bool,
 }
 
 #[derive(Deserialize)]
@@ -793,6 +902,14 @@ fn runtime_hello_health_metadata_is_process_bound() {
 
     for response in [&first_response, &second_response, &changed_response] {
         assert_eq!(response["ok"], true, "hello trust metadata failed");
+        assert!(
+            response["result"].get("actor_id").is_none(),
+            "process metadata must not be represented as a trusted actor identity"
+        );
+        assert!(
+            response["result"].get("client_label").is_some(),
+            "hello must expose process metadata as an untrusted client label"
+        );
     }
     let first: HelloResult =
         serde_json::from_value(first_response["result"].clone()).expect("first hello result");
@@ -801,9 +918,9 @@ fn runtime_hello_health_metadata_is_process_bound() {
     let changed: HelloResult =
         serde_json::from_value(changed_response["result"].clone()).expect("changed hello result");
 
-    assert_eq!(first.actor_id, "actor-first");
-    assert_eq!(second.actor_id, "actor-second");
-    assert_eq!(changed.actor_id, "actor-changed");
+    assert_eq!(first.client_label, "actor-first");
+    assert_eq!(second.client_label, "actor-second");
+    assert_eq!(changed.client_label, "actor-changed");
     assert_eq!(first.schema_sha256, schema_digest(SCHEMA_KDL));
     assert_eq!(second.schema_sha256, first.schema_sha256);
     assert_eq!(changed.schema_sha256, schema_digest(&modified_schema));
@@ -849,6 +966,41 @@ fn runtime_create_restore_uses_backend_and_survives_process_restart() {
 }
 
 #[test]
+fn runtime_restore_rejects_snapshot_from_foreign_trust_bundle() {
+    let backend = BackendProcess::spawn("restore-trust", SCHEMA_KDL);
+    let mut source = BridgeProcess::spawn_with_backend(
+        "restore-trust-source",
+        "source-client",
+        SCHEMA_KDL,
+        Some(&backend.url),
+    );
+    let create = source.exchange("space.create", json!({}));
+    let space_id = create.response["result"]["space_id"]
+        .as_str()
+        .expect("created space ID")
+        .to_owned();
+    let snapshot = source.exchange("space.snapshot", json!({"space_id": space_id}));
+    let snapshot = snapshot.response["result"]["snapshot"].clone();
+    source.finish();
+
+    let modified_schema = format!(
+        "{SCHEMA_KDL}\ntable \"foreign_trust_probe\" {{\n    column \"id\" type=\"int\" plaintext=#true\n}}\n"
+    );
+    let mut target = BridgeProcess::spawn_with_backend(
+        "restore-trust-target",
+        "target-client",
+        &modified_schema,
+        Some(&backend.url),
+    );
+    let restore = target.exchange("space.restore", json!({"snapshot": snapshot}));
+
+    assert_eq!(restore.response["ok"], false);
+    assert_eq!(restore.response["error"]["code"], "TRUST_MISMATCH");
+    target.finish();
+    drop(backend);
+}
+
+#[test]
 fn runtime_snapshot_sync_runs_verified_backend_recovery() {
     let actor = "actor-snapshot-sync-parametric";
     let mut scenario = Scenario::start("snapshot-sync", &[actor]);
@@ -858,7 +1010,7 @@ fn runtime_snapshot_sync_runs_verified_backend_recovery() {
     let sync = scenario.request(actor, "space.sync", json!({"space_id": space_id}));
 
     scenario.verify::<SyncResult, _>(sync, |result| {
-        (result.space_id == space_id && result.synced)
+        (result.space_id == space_id && result.synced && result.wait_trigger.is_none())
             .then_some(())
             .ok_or_else(|| "space.sync did not complete verified recovery".to_owned())
     });
@@ -866,21 +1018,340 @@ fn runtime_snapshot_sync_runs_verified_backend_recovery() {
 }
 
 #[test]
-fn runtime_sync_wait_wakes_and_runs_verified_recovery() {
-    let actor = "actor-sync-wait-parametric";
-    let mut scenario = Scenario::start("sync-wait", &[actor]);
-    let create = scenario.request(actor, "space.create", json!({}));
-    let space_id = scenario.returned_string(create, "space_id", "missing-wait-space");
-    let sync = scenario.request(
-        actor,
-        "space.sync",
-        json!({"space_id": space_id, "wait_for_change_ms": 25}),
+#[ignore = "release gate: generates and verifies a real RISC Zero receipt"]
+fn runtime_packaged_backend_generates_real_fast_forward_receipt() {
+    assert_eq!(
+        std::env::var("ENCRYPTED_SPACES_REQUIRE_REAL_PROOF").as_deref(),
+        Ok("1"),
+        "real-proof release gate was not explicitly enabled"
     );
+    assert!(std::env::var_os("RISC0_DEV_MODE").is_none());
+    assert!(std::env::var_os("RISC0_SKIP_BUILD").is_none());
 
+    let owner = "owner-real-proof-release";
+    let member = "member-real-proof-release";
+    let proof_timeout = Duration::from_secs(3600);
+    let mut scenario = Scenario::start("real-proof-release", &[owner, member]);
+
+    let create_pending = scenario.send(owner, "space.create", json!({}));
+    let create = scenario.receive(owner, create_pending, proof_timeout);
+    let space_id = scenario.returned_string(create, "space_id", "missing-real-proof-space");
+    let invite_pending = scenario.send(owner, "member.invite", json!({"space_id": space_id}));
+    let invite = scenario.receive(owner, invite_pending, proof_timeout);
+    let invite_value = scenario.returned_value(invite, "invite", json!({"missing": "invite"}));
+    let join_pending = scenario.send(member, "space.join", join_payload(invite_value));
+    scenario.receive(member, join_pending, proof_timeout);
+
+    let snapshot_pending = scenario.send(owner, "space.snapshot", json!({"space_id": space_id}));
+    let snapshot = scenario.receive(owner, snapshot_pending, proof_timeout);
+    let current_change_id = scenario.observations[snapshot].response["result"]["snapshot"]["state"]
+        ["current_change_id"]
+        .as_u64()
+        .expect("snapshot current_change_id");
+    let changes_to_boundary = 5 - (current_change_id % 5);
+    let mut last_insert = None;
+    for offset in 0..changes_to_boundary {
+        let pending = scenario.send(
+            owner,
+            "table.insert",
+            json!({
+                "space_id": space_id,
+                "table": TABLE,
+                "row": parent_row(
+                    &format!("real-proof-boundary-{offset}"),
+                    900 + offset as i64,
+                ),
+            }),
+        );
+        last_insert = Some(scenario.receive(owner, pending, proof_timeout));
+    }
+
+    let sync_pending = scenario.send(member, "space.sync", json!({"space_id": space_id}));
+    let sync = scenario.receive(member, sync_pending, proof_timeout);
+    scenario.verify::<TableInsertResult, _>(
+        last_insert.expect("proof-boundary insert"),
+        |result| {
+            (result.row_id > 0)
+                .then_some(())
+                .ok_or_else(|| "proof-boundary insert failed".to_owned())
+        },
+    );
     scenario.verify::<SyncResult, _>(sync, |result| {
         (result.space_id == space_id && result.synced)
             .then_some(())
-            .ok_or_else(|| "waited space.sync did not run verified recovery".to_owned())
+            .ok_or_else(|| "second client did not verify real fast-forward receipt".to_owned())
+    });
+    scenario.finish();
+}
+
+#[test]
+fn runtime_sync_wait_wakes_and_runs_verified_recovery() {
+    let owner = "owner-sync-wait-parametric";
+    let member = "member-sync-wait-parametric";
+    let mut scenario = Scenario::start("sync-wait", &[owner, member]);
+    let create = scenario.request(owner, "space.create", json!({}));
+    let space_id = scenario.returned_string(create, "space_id", "missing-wait-space");
+    let invite = scenario.request(owner, "member.invite", json!({"space_id": space_id}));
+    let invite_value = scenario.returned_value(invite, "invite", json!({"missing": "invite"}));
+    scenario.request(member, "space.join", join_payload(invite_value));
+    scenario.request(owner, "space.sync", json!({"space_id": space_id}));
+
+    let pending = scenario.send(
+        owner,
+        "space.sync",
+        json!({"space_id": space_id, "wait_for_change_ms": 30_000}),
+    );
+    let registration_barrier = scenario.request(owner, "version", json!({}));
+    scenario.request(
+        member,
+        "table.insert",
+        json!({
+            "space_id": space_id,
+            "table": TABLE,
+            "row": parent_row("wake-on-real-change-parametric", 613),
+        }),
+    );
+    let sync = scenario.receive(owner, pending, RESPONSE_TIMEOUT);
+
+    scenario.verify::<VersionResult, _>(registration_barrier, |result| {
+        (!result.version.is_empty() && result.protocol_version == PROTOCOL_VERSION)
+            .then_some(())
+            .ok_or_else(|| "ordinary request blocked behind waiting sync".to_owned())
+    });
+
+    scenario.verify::<SyncResult, _>(sync, |result| {
+        (result.space_id == space_id
+            && result.synced
+            && result.wait_trigger.as_deref() == Some("change"))
+        .then_some(())
+        .ok_or_else(|| "space.sync did not wake on the real remote change".to_owned())
+    });
+    scenario.finish();
+}
+
+#[test]
+fn runtime_cancellation_interrupts_valid_wait_and_keeps_process_usable() {
+    let actor = "actor-cancel-wait-parametric";
+    let mut scenario = Scenario::start("cancel-wait", &[actor]);
+    let create = scenario.request(actor, "space.create", json!({}));
+    let space_id = scenario.returned_string(create, "space_id", "missing-cancel-space");
+    let waiting = scenario.send(
+        actor,
+        "space.sync",
+        json!({"space_id": space_id, "wait_for_change_ms": 30_000}),
+    );
+    let waiting_request_id = waiting.request_id.clone();
+    let cancel = scenario.send(actor, "cancel", json!({"request_id": waiting_request_id}));
+    let canceled = scenario.receive(actor, waiting, RESPONSE_TIMEOUT);
+    let cancel_ack = scenario.receive(actor, cancel, RESPONSE_TIMEOUT);
+    let version = scenario.request(actor, "version", json!({}));
+
+    scenario.verify_error::<BridgeError, _>(canceled, |error| {
+        (error.code == "CANCELED")
+            .then_some(())
+            .ok_or_else(|| "valid waiting sync did not return CANCELED".to_owned())
+    });
+    scenario.verify::<CancelResult, _>(cancel_ack, |result| {
+        result
+            .canceled
+            .then_some(())
+            .ok_or_else(|| "cancel acknowledgment did not report cancellation".to_owned())
+    });
+    scenario.verify::<VersionResult, _>(version, |result| {
+        (!result.version.is_empty() && result.protocol_version == PROTOCOL_VERSION)
+            .then_some(())
+            .ok_or_else(|| "bridge was unusable after cancellation".to_owned())
+    });
+    scenario.finish();
+}
+
+#[test]
+fn runtime_shutdown_cancels_pending_wait_before_exit() {
+    let actor = "actor-shutdown-wait";
+    let mut scenario = Scenario::start("shutdown-wait", &[actor]);
+    let create = scenario.request(actor, "space.create", create_payload());
+    let space_id = scenario.returned_string(create, "space_id", "missing-shutdown-space");
+    let waiting = scenario.send(
+        actor,
+        "space.sync",
+        json!({"space_id": space_id, "wait_for_change_ms": 30_000}),
+    );
+    let shutdown = scenario.send(actor, "shutdown", json!({}));
+
+    let canceled = scenario.receive(actor, waiting, RESPONSE_TIMEOUT);
+    let shutdown_ack = scenario.receive(actor, shutdown, RESPONSE_TIMEOUT);
+    scenario.verify_error::<BridgeError, _>(canceled, |error| {
+        (error.code == "CANCELED")
+            .then_some(())
+            .ok_or_else(|| "shutdown did not cancel the pending wait".to_owned())
+    });
+    scenario.verify::<ShutdownResult, _>(shutdown_ack, |result| {
+        result
+            .shutting_down
+            .then_some(())
+            .ok_or_else(|| "shutdown was not acknowledged".to_owned())
+    });
+
+    let mut bridge = scenario
+        .bridges
+        .remove(actor)
+        .expect("shutdown bridge process");
+    let status = bridge.wait_for_exit();
+    bridge.join_reader();
+    bridge.remove_schema_fixture();
+    assert!(status.success(), "bridge exited with {status}");
+    scenario.finish();
+}
+
+#[test]
+fn runtime_eof_cancels_pending_wait_before_exit() {
+    let actor = "actor-eof-wait";
+    let mut scenario = Scenario::start("eof-wait", &[actor]);
+    let create = scenario.request(actor, "space.create", create_payload());
+    let space_id = scenario.returned_string(create, "space_id", "missing-eof-space");
+    let waiting = scenario.send(
+        actor,
+        "space.sync",
+        json!({"space_id": space_id, "wait_for_change_ms": 30_000}),
+    );
+    scenario
+        .bridges
+        .get_mut(actor)
+        .expect("EOF bridge process")
+        .stdin
+        .take();
+
+    let canceled = scenario.receive(actor, waiting, RESPONSE_TIMEOUT);
+    scenario.verify_error::<BridgeError, _>(canceled, |error| {
+        (error.code == "CANCELED")
+            .then_some(())
+            .ok_or_else(|| "EOF did not cancel the pending wait".to_owned())
+    });
+
+    let mut bridge = scenario.bridges.remove(actor).expect("EOF bridge process");
+    let status = bridge.wait_for_exit();
+    bridge.join_reader();
+    bridge.remove_schema_fixture();
+    assert!(status.success(), "bridge exited with {status}");
+    scenario.finish();
+}
+
+#[test]
+fn runtime_sync_wait_reports_timeout_without_remote_change() {
+    let actor = "actor-wait-timeout-parametric";
+    let mut scenario = Scenario::start("wait-timeout", &[actor]);
+    let create = scenario.request(actor, "space.create", json!({}));
+    let space_id = scenario.returned_string(create, "space_id", "missing-timeout-space");
+    let sync = scenario.request(
+        actor,
+        "space.sync",
+        json!({"space_id": space_id, "wait_for_change_ms": 50}),
+    );
+
+    scenario.verify::<SyncResult, _>(sync, |result| {
+        (result.space_id == space_id
+            && result.synced
+            && result.wait_trigger.as_deref() == Some("timeout"))
+        .then_some(())
+        .ok_or_else(|| "waiting sync did not report timeout completion".to_owned())
+    });
+    scenario.finish();
+}
+
+#[test]
+fn runtime_rejects_request_id_reuse_while_wait_is_pending() {
+    let actor = "actor-duplicate-id-parametric";
+    let mut scenario = Scenario::start("duplicate-id", &[actor]);
+    let create = scenario.request(actor, "space.create", json!({}));
+    let space_id = scenario.returned_string(create, "space_id", "missing-duplicate-space");
+    let waiting = scenario.send(
+        actor,
+        "space.sync",
+        json!({"space_id": space_id, "wait_for_change_ms": 30_000}),
+    );
+    let waiting_request_id = waiting.request_id.clone();
+    scenario.request(actor, "version", json!({}));
+    let duplicate = scenario
+        .bridges
+        .get_mut(actor)
+        .expect("actor bridge")
+        .send_with_request_id(waiting_request_id.clone(), "version", json!({}));
+    let duplicate = scenario.receive(actor, duplicate, RESPONSE_TIMEOUT);
+    let cancel = scenario.send(actor, "cancel", json!({"request_id": waiting_request_id}));
+    let canceled = scenario.receive(actor, waiting, RESPONSE_TIMEOUT);
+    let cancel_ack = scenario.receive(actor, cancel, RESPONSE_TIMEOUT);
+
+    scenario.verify_error::<BridgeError, _>(duplicate, |error| {
+        (error.code == "DUPLICATE_REQUEST_ID")
+            .then_some(())
+            .ok_or_else(|| "pending request ID was reused".to_owned())
+    });
+    scenario.verify_error::<BridgeError, _>(canceled, |error| {
+        (error.code == "CANCELED")
+            .then_some(())
+            .ok_or_else(|| "pending wait was not canceled".to_owned())
+    });
+    scenario.verify::<CancelResult, _>(cancel_ack, |result| {
+        result
+            .canceled
+            .then_some(())
+            .ok_or_else(|| "cancel acknowledgment was false".to_owned())
+    });
+    scenario.finish();
+}
+
+#[test]
+fn runtime_cancel_validation_cannot_reuse_a_pending_request_id() {
+    let actor = "actor-cancel-duplicate-parametric";
+    let mut scenario = Scenario::start("cancel-duplicate", &[actor]);
+    let create = scenario.request(actor, "space.create", json!({}));
+    let space_id = scenario.returned_string(create, "space_id", "missing-cancel-space");
+    let waiting = scenario.send(
+        actor,
+        "space.sync",
+        json!({"space_id": space_id, "wait_for_change_ms": 30_000}),
+    );
+    let waiting_request_id = waiting.request_id.clone();
+    scenario.request(actor, "version", json!({}));
+
+    let malformed = scenario
+        .bridges
+        .get_mut(actor)
+        .expect("actor bridge")
+        .send_with_request_id(waiting_request_id.clone(), "cancel", json!({}));
+    let malformed = scenario.receive(actor, malformed, RESPONSE_TIMEOUT);
+    let self_targeting = scenario
+        .bridges
+        .get_mut(actor)
+        .expect("actor bridge")
+        .send_with_request_id(
+            waiting_request_id.clone(),
+            "cancel",
+            json!({"request_id": waiting_request_id}),
+        );
+    let self_targeting = scenario.receive(actor, self_targeting, RESPONSE_TIMEOUT);
+
+    let cancel = scenario.send(actor, "cancel", json!({"request_id": waiting_request_id}));
+    let canceled = scenario.receive(actor, waiting, RESPONSE_TIMEOUT);
+    let cancel_ack = scenario.receive(actor, cancel, RESPONSE_TIMEOUT);
+
+    for duplicate in [malformed, self_targeting] {
+        scenario.verify_error::<BridgeError, _>(duplicate, |error| {
+            (error.code == "DUPLICATE_REQUEST_ID")
+                .then_some(())
+                .ok_or_else(|| "cancel validation reused a pending correlation ID".to_owned())
+        });
+    }
+    scenario.verify_error::<BridgeError, _>(canceled, |error| {
+        (error.code == "CANCELED")
+            .then_some(())
+            .ok_or_else(|| "pending wait was not canceled after duplicate probes".to_owned())
+    });
+    scenario.verify::<CancelResult, _>(cancel_ack, |result| {
+        result
+            .canceled
+            .then_some(())
+            .ok_or_else(|| "cancel acknowledgment was false".to_owned())
     });
     scenario.finish();
 }
@@ -964,7 +1435,7 @@ fn runtime_space_lifecycle_survives_restart_and_membership_changes() {
 
     scenario.verify::<HelloResult, _>(hello, |result| {
         (result.protocol_version == PROTOCOL_VERSION
-            && result.actor_id == owner
+            && result.client_label == owner
             && valid_digest(&result.schema_sha256)
             && valid_digest(&result.data_commitment)
             && result.ff_guest_image_id.len() == 8)
@@ -1199,6 +1670,22 @@ fn runtime_text_create_edit_read_round_trip() {
         "text.read",
         json!({"space_id": space_id, "text_ref": text_ref}),
     );
+    let out_of_range = scenario.request(
+        actor,
+        "text.edit",
+        json!({
+            "space_id": space_id,
+            "text_ref": text_ref,
+            "position": edited.chars().count() + 1,
+            "delete_count": 0,
+            "insert": "must-not-commit",
+        }),
+    );
+    let read_after_rejection = scenario.request(
+        actor,
+        "text.read",
+        json!({"space_id": space_id, "text_ref": text_ref}),
+    );
     let wrong_kind = scenario.request(
         actor,
         "list.read",
@@ -1234,10 +1721,126 @@ fn runtime_text_create_edit_read_round_trip() {
             .then_some(())
             .ok_or_else(|| "text.read did not return the edited textarea".to_owned())
     });
+    scenario.verify_error::<BridgeError, _>(out_of_range, |error| {
+        (error.code == "INVALID_REQUEST")
+            .then_some(())
+            .ok_or_else(|| "text.edit did not reject an out-of-range edit preflight".to_owned())
+    });
+    scenario.verify::<TextReadResult, _>(read_after_rejection, |result| {
+        (result.text == edited)
+            .then_some(())
+            .ok_or_else(|| "rejected text.edit changed the document".to_owned())
+    });
     scenario.verify_error::<BridgeError, _>(wrong_kind, |error| {
         (error.code == "INVALID_REQUEST")
             .then_some(())
             .ok_or_else(|| "list.read accepted a text capability".to_owned())
+    });
+    scenario.finish();
+}
+
+#[test]
+fn runtime_opaque_refs_cannot_cross_space_boundaries() {
+    let actor = "actor-ref-space-boundary";
+    let mut scenario = Scenario::start("ref-space-boundary", &[actor]);
+    let first_create = scenario.request(actor, "space.create", create_payload());
+    let first_space = scenario.returned_string(first_create, "space_id", "missing-first-space");
+    let first_insert = scenario.request(
+        actor,
+        "table.insert",
+        json!({
+            "space_id": first_space,
+            "table": TABLE,
+            "row": parent_row("first-space-parent", 101),
+        }),
+    );
+    let first_row_id = scenario.observations[first_insert].response["result"]["row_id"]
+        .as_i64()
+        .unwrap_or(-1);
+    let list_create = scenario.request(
+        actor,
+        "list.create",
+        json!({
+            "space_id": first_space,
+            "table": TABLE,
+            "row_id": first_row_id,
+            "column": LIST_COLUMN,
+        }),
+    );
+    let stale_list_ref = scenario.returned_value(
+        list_create,
+        "list_ref",
+        json!({"missing": "first-space-list-ref"}),
+    );
+    let text_create = scenario.request(
+        actor,
+        "text.create",
+        json!({
+            "space_id": first_space,
+            "table": TABLE,
+            "row_id": first_row_id,
+            "column": TEXT_COLUMN,
+        }),
+    );
+    let stale_text_ref = scenario.returned_value(
+        text_create,
+        "text_ref",
+        json!({"missing": "first-space-text-ref"}),
+    );
+
+    let close = scenario.request(actor, "close", json!({}));
+    let second_create = scenario.request(actor, "space.create", create_payload());
+    let second_space = scenario.returned_string(second_create, "space_id", "missing-second-space");
+    let second_insert = scenario.request(
+        actor,
+        "table.insert",
+        json!({
+            "space_id": second_space,
+            "table": TABLE,
+            "row": parent_row("second-space-parent", 202),
+        }),
+    );
+    let stale_append = scenario.request(
+        actor,
+        "list.append",
+        json!({
+            "space_id": second_space,
+            "list_ref": stale_list_ref,
+            "value": {"must": "not-cross-space"},
+        }),
+    );
+    let stale_edit = scenario.request(
+        actor,
+        "text.edit",
+        json!({
+            "space_id": second_space,
+            "text_ref": stale_text_ref,
+            "position": 0,
+            "delete_count": 0,
+            "insert": "must-not-cross-space",
+        }),
+    );
+
+    scenario.verify::<CloseResult, _>(close, |result| {
+        result
+            .closed
+            .then_some(())
+            .ok_or_else(|| "close did not release the first Space".to_owned())
+    });
+    scenario.verify::<TableInsertResult, _>(second_insert, |result| {
+        (result.row_id == first_row_id)
+            .then_some(())
+            .ok_or_else(|| "test did not reproduce matching row coordinates".to_owned())
+    });
+    scenario.verify_error::<BridgeError, _>(stale_append, |error| {
+        (error.code == "INVALID_STATE")
+            .then_some(())
+            .ok_or_else(|| "stale list capability crossed the Space boundary".to_owned())
+    });
+    scenario.verify_error::<BridgeError, _>(stale_edit, |error| {
+        (error.code == "INVALID_STATE")
+            .then_some(())
+            .ok_or_else(|| "stale text capability crossed the Space boundary".to_owned())
     });
     scenario.finish();
 }
@@ -1440,30 +2043,78 @@ fn release_contract_builds_and_publishes_native_assets() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
     let workflow = fs::read_to_string(root.join(".github/workflows/release-bridge.yml"))
         .expect("release workflow");
+    let publisher = fs::read_to_string(root.join(".github/workflows/release-publish.yml"))
+        .expect("trusted release publisher");
     let patches = fs::read_to_string(root.join("PATCHES.md")).expect("PATCHES ledger");
     let cargo = fs::read_to_string(root.join("Cargo.toml")).expect("workspace manifest");
     let lock = fs::read_to_string(root.join("Cargo.lock")).expect("workspace lockfile");
     let toolchain =
         fs::read_to_string(root.join("rust-toolchain.toml")).expect("pinned Rust toolchain");
+    let bridge_manifest =
+        fs::read_to_string(root.join("bridge/Cargo.toml")).expect("bridge manifest");
+    let ffproof_manifest =
+        fs::read_to_string(root.join("ffproof/Cargo.toml")).expect("ffproof manifest");
     let bridge_main = fs::read_to_string(root.join("bridge/src/main.rs")).expect("bridge main");
     let backend_config =
         fs::read_to_string(root.join("backend/server/src/app_config.rs")).expect("backend config");
 
-    assert!(workflow.contains("workflow_dispatch:"));
+    assert!(!workflow.contains("workflow_dispatch:"));
+    assert!(!workflow.contains("pull_request:"));
+    assert!(workflow.contains("branches:"));
+    assert!(workflow.contains("- main"));
     assert!(workflow.contains("tags:"));
     assert!(workflow.contains("- 'v*'"));
-    assert!(workflow.contains("  publish:"));
-    assert!(workflow.contains("github.ref_type == 'tag'"));
-    assert!(!workflow.contains("RISC0_SKIP_BUILD"));
+    assert!(!workflow.contains("  publish:"));
+    assert!(!workflow.contains("attestations: write"));
+    assert!(!workflow.contains("id-token: write"));
+    assert!(!workflow.contains("contents: write"));
+    assert!(!workflow.contains("RISC0_SKIP_BUILD:"));
     assert_pinned_actions(&workflow);
+    assert_pinned_actions(&publisher);
 
     let legal = workflow.find("  legal:").expect("legal job");
     let assets = workflow.find("  assets:").expect("asset matrix");
+    let real_proof = workflow.find("  real-proof:").expect("real proof job");
     let aggregate = workflow.find("  aggregate:").expect("aggregate job");
-    let publish = workflow.find("  publish:").expect("publish job");
     assert!(
-        legal < assets && assets < aggregate && aggregate < publish,
+        legal < assets && assets < real_proof && real_proof < aggregate,
         "release jobs have unexpected layout"
+    );
+    assert!(workflow[assets..real_proof].contains("needs: legal"));
+
+    for marker in [
+        "workflow_run:",
+        "- Encrypted Spaces Release",
+        "types: [completed]",
+        "github.event.workflow_run.conclusion == 'success'",
+        "github.event.workflow_run.event == 'push'",
+        "github.event.workflow_run.id",
+        "github.event.workflow_run.head_sha",
+        "run-id:",
+        "ref: main",
+        "git fetch origin main:refs/remotes/origin/main",
+        "git merge-base --is-ancestor \"$HEAD_SHA\" origin/main",
+        "refs/tags/v$RELEASE_VERSION",
+        "actions/attest@a1948c3f048ba23858d222213b7c278aabede763",
+        "attestations: write",
+        "id-token: write",
+        "bundle-path",
+        "release-manifest.json",
+        "actions/download-artifact@",
+        "actions/upload-artifact@",
+        "gh release create",
+        "  aggregate:",
+        "  publish:",
+    ] {
+        assert!(publisher.contains(marker), "publisher omits {marker}");
+    }
+    assert!(!publisher.contains("workflow_dispatch:"));
+    assert_eq!(
+        publisher
+            .matches("git merge-base --is-ancestor \"$HEAD_SHA\" origin/main")
+            .count(),
+        2,
+        "main ancestry must be checked before attestation and publication"
     );
 
     for marker in [
@@ -1471,11 +2122,23 @@ fn release_contract_builds_and_publishes_native_assets() {
         "RELEASE_VERSION: 0.1.0",
         "UPSTREAM_COMMIT: 4cda0ae87698135aa672990e6e68cf7873847426",
         "RUST_VERSION: 1.94.1",
-        "curl -L https://risczero.com/install | bash",
-        "rzup install",
+        "RZUP_VERSION: 0.5.1",
+        "RISC0_VERSION: 3.0.5",
+        "RISC0_RUST_VERSION: 1.94.1",
+        "cargo install rzup --version \"$RZUP_VERSION\" --locked",
+        "rzup install cargo-risczero \"$RISC0_VERSION\"",
+        "rzup install r0vm \"$RISC0_VERSION\"",
+        "rzup install rust \"$RISC0_RUST_VERSION\"",
         "cargo risczero --version",
-        "cargo test --locked -p",
-        "cargo build --locked --release -p",
+        "--features real-proofs",
+        "ENCRYPTED_SPACES_BRIDGE_TEST_BINARY",
+        "ENCRYPTED_SPACES_BACKEND_TEST_BINARY",
+        "cargo test -p encrypted-spaces-bridge --locked --features real-proofs runtime_",
+        "runtime_packaged_backend_generates_real_fast_forward_receipt",
+        "ENCRYPTED_SPACES_REQUIRE_REAL_PROOF: 1",
+        "ENCRYPTED_SPACES_REQUEST_TIMEOUT_MS: 3600000",
+        "command -v r0vm",
+        "env -u RISC0_DEV_MODE -u RISC0_SKIP_BUILD",
         "test -x",
         "cmp",
         "file -b",
@@ -1483,17 +2146,16 @@ fn release_contract_builds_and_publishes_native_assets() {
         "tar -czf",
         "sha256sum",
         "shasum -a 256",
-        "release-manifest.json",
-        "https://in-toto.io/Statement/v1",
-        "https://slsa.dev/provenance/v1",
+        "GITHUB_SHA",
         "actions/upload-artifact@",
         "actions/download-artifact@",
-        "gh release create",
-        "needs: [legal, assets]",
-        "if: ${{ always() }}",
+        "name: release-backend-linux-amd64",
+        "name: release-bridge-linux-amd64",
+        "tar -xzf dist/encrypted-spaces-backend-linux-amd64.tar.gz",
     ] {
         assert!(workflow.contains(marker), "release workflow omits {marker}");
     }
+    assert!(!workflow.contains("github.event_name != 'pull_request'"));
     for archive in RELEASE_ARCHIVES {
         assert!(
             workflow.contains(archive),
@@ -1508,6 +2170,8 @@ fn release_contract_builds_and_publishes_native_assets() {
     assert!(nonempty(&root.join("NOTICE")), "NOTICE is absent or empty");
     assert!(cargo.contains("version = \"0.1.0\""));
     assert!(cargo.contains("kdl = { version = \"=6.5.0\""));
+    assert!(bridge_manifest.contains("real-proofs = [\"encrypted-spaces-ffproof/real-proofs\"]"));
+    assert!(ffproof_manifest.contains("real-proofs = [\"risc0-zkvm/prove\"]"));
     assert!(lock.contains("name = \"kdl\"\nversion = \"6.5.0\""));
     assert!(toolchain.contains("channel = \"1.94.1\""));
     assert!(toolchain.contains("\"rustfmt\""));
@@ -1526,19 +2190,56 @@ fn upstream_sync_opens_ci_gated_automerge_prs() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
     let workflow = fs::read_to_string(root.join(".github/workflows/upstream-sync.yml"))
         .expect("upstream sync workflow");
+    let compatibility = fs::read_to_string(root.join(".github/workflows/upstream-compat.yml"))
+        .expect("trusted upstream compatibility workflow");
 
     assert!(workflow.contains("schedule:"));
     assert!(workflow.contains("cron:"));
     assert!(workflow.contains("workflow_dispatch:"));
     assert!(workflow.contains("contents: write"));
     assert!(workflow.contains("pull-requests: write"));
+    assert!(workflow.contains("actions: write"));
     assert!(workflow.contains("https://github.com/encrypted-spaces/prototype.git"));
     assert!(workflow.contains("git fetch upstream main"));
     assert!(workflow.contains("upstream/main"));
     assert!(workflow.contains("gh pr create"));
-    assert!(workflow.contains("gh pr merge"));
-    assert!(workflow.contains("--auto"));
-    assert!(workflow.contains("--squash"));
+    assert!(workflow.contains("git merge --no-edit upstream/main"));
+    assert!(workflow.contains("git merge --abort"));
+    assert!(workflow.contains("trigger_and_wait upstream-compat.yml"));
+    assert!(workflow.contains("--ref main"));
+    assert!(workflow.contains("candidate_sha"));
+    assert!(workflow.contains("candidate_sha=\"$(git rev-parse \"origin/$branch\")\""));
+    assert!(workflow.contains("correlation_id"));
+    assert!(workflow.contains("--json databaseId,displayTitle,headSha"));
+    assert!(workflow.contains("gh pr view \"$PR_URL\""));
+    assert!(!workflow.contains("trigger_and_wait build-prototype.yml"));
+    assert!(!workflow.contains("trigger_and_wait lint-prototype.yml"));
+    assert!(workflow.contains("gh run watch"));
+    assert!(workflow.contains("--force-with-lease=\"refs/heads/main:$FORK_MAIN_SHA\""));
+    assert!(workflow.contains("$CANDIDATE_SHA:refs/heads/main"));
+    assert!(!workflow.contains("gh pr merge"));
+    assert!(!workflow.contains("--auto"));
+    assert!(!workflow.contains("--squash"));
     assert!(workflow.contains("remains open"));
     assert_pinned_actions(&workflow);
+
+    assert!(compatibility.contains("workflow_dispatch:"));
+    assert!(compatibility.contains("candidate_sha:"));
+    assert!(compatibility.contains("correlation_id:"));
+    assert!(compatibility.contains("run-name:"));
+    assert!(compatibility.contains("inputs.correlation_id"));
+    assert!(compatibility.contains("permissions:\n  contents: read"));
+    assert!(compatibility.contains("runs-on: ubuntu-24.04"));
+    assert!(compatibility.contains("ref: ${{ inputs.candidate_sha }}"));
+    assert!(compatibility.contains("fetch-depth: 0"));
+    assert!(compatibility.contains("git merge-base --is-ancestor \"$FORK_MAIN_SHA\" HEAD"));
+    assert!(compatibility.contains("git merge-base --is-ancestor \"$UPSTREAM_SHA\" HEAD"));
+    assert!(compatibility.contains("persist-credentials: false"));
+    assert!(!compatibility.contains("secrets."));
+    assert!(compatibility.contains("cargo fmt --all -- --check"));
+    assert!(
+        compatibility.contains("cargo clippy --workspace --all-targets --locked -- -D warnings")
+    );
+    assert!(compatibility.contains("cargo test --workspace --locked"));
+    assert_pinned_actions(&compatibility);
 }

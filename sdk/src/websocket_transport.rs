@@ -18,6 +18,10 @@ use encrypted_spaces_changelog_core::changelog::{
 use encrypted_spaces_key_manager::{InviteRequest, RekeyRequest};
 use prost::Message;
 pub(crate) const DEBUG: bool = true;
+#[cfg(not(target_arch = "wasm32"))]
+const DEFAULT_NATIVE_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+#[cfg(not(target_arch = "wasm32"))]
+const MAX_HTTP_BODY_BYTES: usize = 64 * 1024 * 1024;
 
 // Consolidated logging macros (wasm + native)
 macro_rules! log_debug {
@@ -50,6 +54,114 @@ enum PendingResponse {
     Db(Result<DbResponse>),
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+type NativePendingMap = std::sync::Arc<
+    std::sync::Mutex<
+        std::collections::HashMap<String, tokio::sync::oneshot::Sender<PendingResponse>>,
+    >,
+>;
+
+#[cfg(not(target_arch = "wasm32"))]
+struct PendingRequestGuard {
+    request_id: String,
+    pending: NativePendingMap,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl PendingRequestGuard {
+    fn new(request_id: String, pending: NativePendingMap) -> Self {
+        Self {
+            request_id,
+            pending,
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for PendingRequestGuard {
+    fn drop(&mut self) {
+        if let Ok(mut pending) = self.pending.lock() {
+            pending.remove(&self.request_id);
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn with_request_timeout<T, F>(
+    request_id: &str,
+    timeout: std::time::Duration,
+    future: F,
+) -> Result<T>
+where
+    F: std::future::Future<Output = Result<T>>,
+{
+    match tokio::time::timeout(timeout, future).await {
+        Ok(result) => result,
+        Err(_) => Err(SdkError::DatabaseError(format!(
+            "request {request_id} timed out"
+        ))),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn with_db_request_timeout<T, F>(
+    request_id: &str,
+    timeout: std::time::Duration,
+    may_commit: bool,
+    transmission_started: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    future: F,
+) -> Result<T>
+where
+    F: std::future::Future<Output = Result<T>>,
+{
+    match tokio::time::timeout(timeout, future).await {
+        Ok(result) => result,
+        Err(_) if may_commit && transmission_started.load(std::sync::atomic::Ordering::Acquire) => {
+            Err(SdkError::CommitOutcomeUnknown(format!(
+                "request {request_id} timed out after transmission began"
+            )))
+        }
+        Err(_) => Err(SdkError::DatabaseError(format!(
+            "request {request_id} timed out"
+        ))),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn collect_bounded_body(mut body: hyper::Body, limit: usize) -> Result<Vec<u8>> {
+    use hyper::body::HttpBody;
+
+    let mut bytes = Vec::new();
+    while let Some(chunk) = body.data().await {
+        let chunk =
+            chunk.map_err(|error| SdkError::DatabaseError(format!("response body: {error}")))?;
+        let new_len = bytes
+            .len()
+            .checked_add(chunk.len())
+            .ok_or_else(|| SdkError::DatabaseError("response body is too large".to_owned()))?;
+        if new_len > limit {
+            return Err(SdkError::DatabaseError(format!(
+                "response body exceeds {limit} bytes"
+            )));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn fail_pending_requests(pending: &NativePendingMap, message: &str) {
+    let requests = pending
+        .lock()
+        .map(|mut pending| pending.drain().collect::<Vec<_>>())
+        .unwrap_or_default();
+    for (_, sender) in requests {
+        let _ = sender.send(PendingResponse::Db(Err(SdkError::DatabaseError(
+            message.to_owned(),
+        ))));
+    }
+}
+
 pub struct WebSocketTransport {
     // Write half of the WebSocket (binary frames) guarded for sequential writes
     write: tokio::sync::Mutex<
@@ -61,11 +173,8 @@ pub struct WebSocketTransport {
         >,
     >,
     // Pending request_id -> oneshot sender awaiting the matching DbResponse
-    pending: std::sync::Arc<
-        tokio::sync::Mutex<
-            std::collections::HashMap<String, tokio::sync::oneshot::Sender<PendingResponse>>,
-        >,
-    >,
+    #[cfg(not(target_arch = "wasm32"))]
+    pending: NativePendingMap,
     // Broadcast event fan-out (multi-subscriber)
     bcast_tx: tokio::sync::broadcast::Sender<BroadcastEvent>,
     // Ephemeral message fan-out (multi-subscriber)
@@ -89,6 +198,8 @@ pub struct WebSocketTransport {
     // (OS trust store only), which matches the pre-trust-anchor behavior.
     #[cfg(not(target_arch = "wasm32"))]
     ws_tls_connector: Option<tokio_native_tls::TlsConnector>,
+    #[cfg(not(target_arch = "wasm32"))]
+    request_timeout: std::time::Duration,
     #[cfg(target_arch = "wasm32")]
     ws: RefCell<Option<web_sys::WebSocket>>,
     #[cfg(target_arch = "wasm32")]
@@ -115,7 +226,15 @@ impl WebSocketTransport {
     /// Construct a transport that uses only the OS trust store for TLS.
     /// Equivalent to [`Self::new_with_trust_connector`] called with `None`.
     pub async fn new(url: &str) -> Result<Self> {
-        Self::new_with_trust_connector(url, None).await
+        Self::new_with_options(url, None, DEFAULT_NATIVE_REQUEST_TIMEOUT).await
+    }
+
+    /// Construct a transport with a caller-selected bounded request deadline.
+    pub async fn new_with_request_timeout(
+        url: &str,
+        request_timeout: std::time::Duration,
+    ) -> Result<Self> {
+        Self::new_with_options(url, None, request_timeout).await
     }
 
     /// Construct a transport that honors `connector` (if `Some`) on every
@@ -139,11 +258,20 @@ impl WebSocketTransport {
         url: &str,
         ws_tls_connector: Option<tokio_native_tls::TlsConnector>,
     ) -> Result<Self> {
-        let pending: std::sync::Arc<
-            tokio::sync::Mutex<
-                std::collections::HashMap<String, tokio::sync::oneshot::Sender<PendingResponse>>,
-            >,
-        > = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        Self::new_with_options(url, ws_tls_connector, DEFAULT_NATIVE_REQUEST_TIMEOUT).await
+    }
+
+    async fn new_with_options(
+        url: &str,
+        ws_tls_connector: Option<tokio_native_tls::TlsConnector>,
+        request_timeout: std::time::Duration,
+    ) -> Result<Self> {
+        if request_timeout.is_zero() {
+            return Err(SdkError::ValidationError(
+                "request timeout must be greater than zero".to_owned(),
+            ));
+        }
+        let pending = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
         let (bcast_tx, _) = tokio::sync::broadcast::channel::<BroadcastEvent>(64);
         let (ephemeral_tx, _) =
             tokio::sync::broadcast::channel::<crate::transport::EphemeralEvent>(64);
@@ -175,6 +303,7 @@ impl WebSocketTransport {
             auth_b64: tokio::sync::Mutex::new(None),
             file_client,
             ws_tls_connector,
+            request_timeout,
         })
     }
 
@@ -196,13 +325,18 @@ impl WebSocketTransport {
             self.url, separator, auth_context.space_id, auth_b64
         );
 
-        let (stream, _resp) = match self.ws_tls_connector.as_ref() {
-            Some(connector) => {
-                connect_async_with_tls_connector(&connect_url, Some(connector.clone())).await
+        let connect = async {
+            match self.ws_tls_connector.as_ref() {
+                Some(connector) => {
+                    connect_async_with_tls_connector(&connect_url, Some(connector.clone())).await
+                }
+                None => connect_async(&connect_url).await,
             }
-            None => connect_async(&connect_url).await,
-        }
-        .map_err(|e| SdkError::DatabaseError(format!("connect ws failed: {e}")))?;
+        };
+        let (stream, _resp) = tokio::time::timeout(self.request_timeout, connect)
+            .await
+            .map_err(|_| SdkError::DatabaseError("connect ws timed out".to_owned()))?
+            .map_err(|e| SdkError::DatabaseError(format!("connect ws failed: {e}")))?;
 
         let (write, mut read) = stream.split();
 
@@ -219,7 +353,10 @@ impl WebSocketTransport {
                         Ok(frame) => match frame.payload {
                             Some(ws_frame::Payload::DbResponse(resp)) => {
                                 let req_id = resp.request_id.clone();
-                                let tx_opt = { pending_clone.lock().await.remove(&req_id) };
+                                let tx_opt = pending_clone
+                                    .lock()
+                                    .ok()
+                                    .and_then(|mut pending| pending.remove(&req_id));
                                 if let Some(tx) = tx_opt {
                                     let result = if resp.status == "ok" {
                                         Ok(resp)
@@ -278,12 +415,6 @@ impl WebSocketTransport {
                     },
                     Ok(Message::Close(cf)) => {
                         log_debug!("read_loop: connection closed: {:?}", cf);
-                        let mut map = pending_clone.lock().await;
-                        for (_id, tx) in map.drain() {
-                            let _ = tx.send(PendingResponse::Db(Err(SdkError::DatabaseError(
-                                "connection closed".into(),
-                            ))));
-                        }
                         break;
                     }
                     Ok(_other) => {
@@ -291,16 +422,11 @@ impl WebSocketTransport {
                     }
                     Err(e) => {
                         log_debug!("read_loop: read error err={}", e);
-                        let mut map = pending_clone.lock().await;
-                        for (_id, tx) in map.drain() {
-                            let _ = tx.send(PendingResponse::Db(Err(SdkError::DatabaseError(
-                                format!("read error: {e}"),
-                            ))));
-                        }
                         break;
                     }
                 }
             }
+            fail_pending_requests(&pending_clone, "connection closed");
             log_debug!("read_loop: terminated");
         });
 
@@ -311,6 +437,32 @@ impl WebSocketTransport {
     }
 
     async fn send_request(&self, req: DbRequest) -> Result<DbResponse> {
+        let request_id = req.request_id.clone();
+        let may_commit = matches!(
+            req.operation,
+            Some(
+                db_request::Operation::Change(_)
+                    | db_request::Operation::AddMember(_)
+                    | db_request::Operation::RemoveMember(_)
+                    | db_request::Operation::Retention(_)
+            )
+        );
+        let transmission_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        with_db_request_timeout(
+            &request_id,
+            self.request_timeout,
+            may_commit,
+            std::sync::Arc::clone(&transmission_started),
+            self.send_request_inner(req, transmission_started),
+        )
+        .await
+    }
+
+    async fn send_request_inner(
+        &self,
+        req: DbRequest,
+        transmission_started: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<DbResponse> {
         use async_tungstenite::tungstenite::Message;
         use futures_util::SinkExt;
         use tokio::sync::oneshot;
@@ -329,24 +481,29 @@ impl WebSocketTransport {
         // Prepare oneshot before sending
         let (tx, rx) = oneshot::channel::<PendingResponse>();
         {
-            let mut map = self.pending.lock().await;
-            if map.insert(request_id.clone(), tx).is_some() {
-                log_debug!(
-                    "native send_request: replaced existing pending id={}",
-                    request_id
-                );
+            let mut pending = self
+                .pending
+                .lock()
+                .map_err(|_| SdkError::DatabaseError("pending request lock poisoned".into()))?;
+            if pending.contains_key(&request_id) {
+                return Err(SdkError::ValidationError(format!(
+                    "duplicate request id {request_id}"
+                )));
             }
+            pending.insert(request_id.clone(), tx);
         }
+        let _pending_guard =
+            PendingRequestGuard::new(request_id.clone(), std::sync::Arc::clone(&self.pending));
 
         // Send frame
         let mut guard = self.write.lock().await;
-        let writer = guard.as_mut().ok_or_else(|| {
-            SdkError::DatabaseError("not connected — call authenticate() first".into())
-        })?;
+        let Some(writer) = guard.as_mut() else {
+            return Err(SdkError::DatabaseError(
+                "not connected — call authenticate() first".into(),
+            ));
+        };
+        transmission_started.store(true, std::sync::atomic::Ordering::Release);
         if let Err(e) = writer.send(Message::Binary(encoded)).await {
-            drop(guard);
-            let mut map = self.pending.lock().await;
-            map.remove(&request_id);
             return Err(SdkError::DatabaseError(format!("send failed: {e}")));
         }
         drop(guard);
@@ -874,15 +1031,19 @@ impl Transport for WebSocketTransport {
             task.abort();
         }
         {
-            let mut guard = self.write.lock().await;
+            let mut guard = tokio::time::timeout(self.request_timeout, self.write.lock())
+                .await
+                .map_err(|_| SdkError::DatabaseError("websocket close timed out".to_owned()))?;
             if let Some(writer) = guard.as_mut() {
                 // Send a proper close frame so the server sees a clean close
                 // instead of "Connection reset without closing handshake".
-                let _ = writer.send(Message::Close(None)).await;
+                let _ =
+                    tokio::time::timeout(self.request_timeout, writer.send(Message::Close(None)))
+                        .await;
             }
             *guard = None;
         }
-        self.pending.lock().await.clear();
+        fail_pending_requests(&self.pending, "connection reauthenticated");
         // Store the base64url-encoded auth context for file HTTP requests
         let auth_json = serde_json::to_vec(auth_context).map_err(|e| {
             SdkError::ValidationError(format!("failed to serialize auth context: {e}"))
@@ -913,15 +1074,18 @@ impl Transport for WebSocketTransport {
         };
         let encoded = frame.encode_to_vec();
 
-        let mut guard = self.write.lock().await;
-        let writer = guard.as_mut().ok_or_else(|| {
-            SdkError::DatabaseError("not connected — call authenticate() first".into())
-        })?;
-        writer
-            .send(Message::Binary(encoded))
-            .await
-            .map_err(|e| SdkError::DatabaseError(format!("send ephemeral failed: {e}")))?;
-        Ok(())
+        with_request_timeout("ephemeral send", self.request_timeout, async {
+            let mut guard = self.write.lock().await;
+            let writer = guard.as_mut().ok_or_else(|| {
+                SdkError::DatabaseError("not connected — call authenticate() first".into())
+            })?;
+            writer
+                .send(Message::Binary(encoded))
+                .await
+                .map_err(|e| SdkError::DatabaseError(format!("send ephemeral failed: {e}")))?;
+            Ok(())
+        })
+        .await
     }
 
     async fn file_upload(&self, hash: &str, data: Vec<u8>) -> Result<()> {
@@ -940,23 +1104,24 @@ impl Transport for WebSocketTransport {
             .body(hyper::Body::from(data))
             .map_err(|e| SdkError::DatabaseError(format!("file upload request build: {e}")))?;
 
-        let resp = self
-            .file_client
-            .request(req)
-            .await
-            .map_err(|e| SdkError::DatabaseError(format!("file upload failed: {e}")))?;
-
-        if resp.status().is_success() {
-            Ok(())
-        } else {
-            let body = hyper::body::to_bytes(resp.into_body())
+        with_request_timeout("file upload", self.request_timeout, async {
+            let resp = self
+                .file_client
+                .request(req)
                 .await
-                .map(|b| String::from_utf8_lossy(&b).to_string())
-                .unwrap_or_default();
-            Err(SdkError::DatabaseError(format!(
-                "file upload failed: {body}"
-            )))
-        }
+                .map_err(|e| SdkError::DatabaseError(format!("file upload failed: {e}")))?;
+
+            if resp.status().is_success() {
+                Ok(())
+            } else {
+                let body = collect_bounded_body(resp.into_body(), MAX_HTTP_BODY_BYTES).await?;
+                Err(SdkError::DatabaseError(format!(
+                    "file upload failed: {}",
+                    String::from_utf8_lossy(&body)
+                )))
+            }
+        })
+        .await
     }
 
     async fn file_download(&self, hash: &str) -> Result<Vec<u8>> {
@@ -971,20 +1136,20 @@ impl Transport for WebSocketTransport {
             .parse()
             .map_err(|e| SdkError::DatabaseError(format!("file download url parse: {e}")))?;
 
-        let resp = self
-            .file_client
-            .get(url)
-            .await
-            .map_err(|e| SdkError::DatabaseError(format!("file download failed: {e}")))?;
-
-        if resp.status().is_success() {
-            let bytes = hyper::body::to_bytes(resp.into_body())
+        with_request_timeout("file download", self.request_timeout, async {
+            let resp = self
+                .file_client
+                .get(url)
                 .await
-                .map_err(|e| SdkError::DatabaseError(format!("file download body: {e}")))?;
-            Ok(bytes.to_vec())
-        } else {
-            Err(SdkError::DatabaseError(format!("file not found: {hash}")))
-        }
+                .map_err(|e| SdkError::DatabaseError(format!("file download failed: {e}")))?;
+
+            if resp.status().is_success() {
+                collect_bounded_body(resp.into_body(), MAX_HTTP_BODY_BYTES).await
+            } else {
+                Err(SdkError::DatabaseError(format!("file not found: {hash}")))
+            }
+        })
+        .await
     }
 }
 
@@ -1030,5 +1195,68 @@ mod hash_backed_change_request_tests {
 
         assert_eq!(request.retention_proofs, vec![b"proof".to_vec()]);
         assert_eq!(request.values_sidecar, vec![full_value]);
+    }
+
+    #[tokio::test]
+    async fn native_timeout_cancellation_removes_pending_request() {
+        let pending = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+        pending
+            .lock()
+            .expect("pending lock")
+            .insert("stalled-request".to_owned(), response_tx);
+        let guarded = async {
+            let _guard = PendingRequestGuard::new(
+                "stalled-request".to_owned(),
+                std::sync::Arc::clone(&pending),
+            );
+            std::future::pending::<Result<()>>().await
+        };
+
+        let error = with_request_timeout(
+            "stalled-request",
+            std::time::Duration::from_millis(1),
+            guarded,
+        )
+        .await
+        .expect_err("stalled request did not time out");
+
+        assert!(error.to_string().contains("timed out"));
+        assert!(pending.lock().expect("pending lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn native_mutation_timeout_after_transmission_is_commit_unknown() {
+        let transmission_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let future_flag = std::sync::Arc::clone(&transmission_started);
+        let stalled_after_send = async move {
+            future_flag.store(true, std::sync::atomic::Ordering::Release);
+            std::future::pending::<Result<()>>().await
+        };
+
+        let error = with_db_request_timeout(
+            "mutation-request",
+            std::time::Duration::from_millis(1),
+            true,
+            transmission_started,
+            stalled_after_send,
+        )
+        .await
+        .expect_err("mutation deadline did not report an unknown commit outcome");
+
+        assert!(matches!(error, SdkError::CommitOutcomeUnknown(_)));
+    }
+
+    #[tokio::test]
+    async fn native_http_body_collection_enforces_limit() {
+        let error = collect_bounded_body(hyper::Body::from(vec![0_u8; 5]), 4)
+            .await
+            .expect_err("oversized body was accepted");
+        assert!(error.to_string().contains("exceeds 4 bytes"));
+
+        let body = collect_bounded_body(hyper::Body::from(vec![1_u8; 4]), 4)
+            .await
+            .expect("body at limit");
+        assert_eq!(body, vec![1_u8; 4]);
     }
 }

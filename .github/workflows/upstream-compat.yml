@@ -1,0 +1,79 @@
+name: Trusted Upstream Compatibility
+run-name: upstream-compat ${{ inputs.candidate_sha }} ${{ inputs.correlation_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_sha:
+        description: Exact fork merge-candidate commit to verify
+        required: true
+        type: string
+      fork_main_sha:
+        description: Trusted fork main commit that must be an ancestor
+        required: true
+        type: string
+      upstream_sha:
+        description: Upstream commit that must be an ancestor
+        required: true
+        type: string
+      correlation_id:
+        description: Unique dispatch correlation token
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: upstream-compat-${{ inputs.candidate_sha }}
+  cancel-in-progress: false
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_TERM_COLOR: always
+  RISC0_DEV_MODE: 1
+  RISC0_SKIP_BUILD: 1
+  RUST_VERSION: 1.94.1
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout untrusted candidate without credentials
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ inputs.candidate_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify exact candidate checkout
+        env:
+          CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+          FORK_MAIN_SHA: ${{ inputs.fork_main_sha }}
+          UPSTREAM_SHA: ${{ inputs.upstream_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          git merge-base --is-ancestor "$FORK_MAIN_SHA" HEAD
+          git merge-base --is-ancestor "$UPSTREAM_SHA" HEAD
+
+      - name: Install trusted build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --fix-missing \
+            libwebkit2gtk-4.1-dev libgtk-3-dev \
+            libayatana-appindicator3-dev librsvg2-dev protobuf-compiler
+          rustup toolchain install "$RUST_VERSION" --profile minimal \
+            --component rustfmt --component clippy
+
+      - name: Format
+        run: rustup run "$RUST_VERSION" cargo fmt --all -- --check
+
+      - name: Lint
+        run: rustup run "$RUST_VERSION" cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: rustup run "$RUST_VERSION" cargo test --workspace --locked

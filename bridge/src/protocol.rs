@@ -1,12 +1,12 @@
 use crate::runtime;
 use crate::schema::{Operation, Request, MAX_REQUEST_ID_BYTES, PROTOCOL_VERSION};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::io::{self, BufRead, Read, Write};
 use std::sync::{
     atomic::{AtomicU8, Ordering},
-    Arc, Mutex,
+    mpsc, Arc, Mutex,
 };
 use std::thread;
 use std::time::Duration;
@@ -17,6 +17,8 @@ const MAX_WAIT_FOR_CHANGE_MS: u64 = 60_000;
 const PENDING: u8 = 0;
 const CANCELED: u8 = 1;
 const COMPLETING: u8 = 2;
+const DONE: u8 = 3;
+const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Serialize)]
 pub struct Response {
@@ -95,133 +97,415 @@ struct CancelResult {
     canceled: bool,
 }
 
-pub fn run<R: Read, W: Write + Send + 'static>(reader: R, writer: W) -> io::Result<()> {
+struct PendingRequest {
+    state: Arc<AtomicU8>,
+    cancelable: bool,
+}
+
+enum RuntimeJob {
+    Dispatch {
+        request: Request,
+        state: Arc<AtomicU8>,
+        wait_trigger: Option<&'static str>,
+    },
+    RegisterWait {
+        request_id: String,
+        payload: WaitSyncPayload,
+        state: Arc<AtomicU8>,
+    },
+}
+
+enum CoordinatorEvent {
+    Frame(Vec<u8>),
+    FrameTooLarge,
+    InputClosed,
+    ReadError(io::Error),
+    Completed {
+        request_id: String,
+        state: Arc<AtomicU8>,
+        response: Response,
+        shutdown: bool,
+    },
+}
+
+pub fn run<R: Read + Send + 'static, W: Write>(reader: R, mut writer: W) -> io::Result<()> {
     let runtime = Arc::new(Mutex::new(runtime::Runtime::from_env()?));
-    let writer = Arc::new(Mutex::new(writer));
-    let mut pending = HashMap::<String, Arc<AtomicU8>>::new();
-    let mut reader = io::BufReader::new(reader);
+    let (event_tx, event_rx) = mpsc::sync_channel(MAX_PENDING_REQUESTS * 2);
+    let (job_tx, job_rx) = mpsc::sync_channel(MAX_PENDING_REQUESTS);
+    spawn_reader(reader, event_tx.clone());
+    spawn_runtime_worker(Arc::clone(&runtime), job_rx, job_tx.clone(), event_tx);
+
+    let mut pending = HashMap::<String, PendingRequest>::new();
+    let mut input_closed = false;
+    let mut shutdown_queued = false;
     loop {
-        let frame = match read_frame(&mut reader) {
-            Ok(Some(frame)) => frame,
-            Ok(None) => return Ok(()),
-            Err(FrameError::TooLarge) => {
-                write_shared_response(
-                    &writer,
+        match event_rx
+            .recv()
+            .map_err(|_| io::Error::other("bridge coordinator stopped"))?
+        {
+            CoordinatorEvent::Frame(frame) => {
+                if shutdown_queued {
+                    let request_id = serde_json::from_slice::<Value>(&frame)
+                        .ok()
+                        .as_ref()
+                        .and_then(parsed_request_id);
+                    let response = if request_id
+                        .as_ref()
+                        .is_some_and(|request_id| pending.contains_key(request_id))
+                    {
+                        Response::error(
+                            None,
+                            "DUPLICATE_REQUEST_ID",
+                            "request ID is already pending",
+                        )
+                    } else {
+                        invalid_state_response_optional(request_id)
+                    };
+                    write_response(&mut writer, response)?;
+                    continue;
+                }
+                let request = match decode_request(&frame) {
+                    Ok(request) => request,
+                    Err(mut response) => {
+                        if response
+                            .request_id
+                            .as_ref()
+                            .is_some_and(|request_id| pending.contains_key(request_id))
+                        {
+                            response.request_id = None;
+                        }
+                        write_response(&mut writer, response)?;
+                        continue;
+                    }
+                };
+
+                if matches!(request.operation, Operation::Cancel) {
+                    cancel_pending(request, &mut pending, &mut writer)?;
+                    continue;
+                }
+                if pending.contains_key(&request.request_id) {
+                    write_response(
+                        &mut writer,
+                        Response::error(
+                            None,
+                            "DUPLICATE_REQUEST_ID",
+                            "request ID is already pending",
+                        ),
+                    )?;
+                    continue;
+                }
+                if pending.len() >= MAX_PENDING_REQUESTS {
+                    write_response(
+                        &mut writer,
+                        Response::error(
+                            Some(request.request_id),
+                            "TOO_MANY_PENDING",
+                            "pending bridge request limit reached",
+                        ),
+                    )?;
+                    continue;
+                }
+
+                if matches!(request.operation, Operation::Shutdown) {
+                    cancel_all_waits(&mut pending, &mut writer)?;
+                    shutdown_queued = true;
+                }
+
+                let request_id = request.request_id.clone();
+                if matches!(request.operation, Operation::Sync)
+                    && request.payload.get("wait_for_change_ms").is_some()
+                {
+                    let payload = match parse_wait_sync(&request_id, request.payload) {
+                        Ok(payload) => payload,
+                        Err(response) => {
+                            write_response(&mut writer, response)?;
+                            continue;
+                        }
+                    };
+                    let state = Arc::new(AtomicU8::new(PENDING));
+                    pending.insert(
+                        request_id.clone(),
+                        PendingRequest {
+                            state: Arc::clone(&state),
+                            cancelable: true,
+                        },
+                    );
+                    if job_tx
+                        .send(RuntimeJob::RegisterWait {
+                            request_id: request_id.clone(),
+                            payload,
+                            state,
+                        })
+                        .is_err()
+                    {
+                        pending.remove(&request_id);
+                        return Err(io::Error::other("runtime worker stopped"));
+                    }
+                    continue;
+                }
+
+                let state = Arc::new(AtomicU8::new(COMPLETING));
+                pending.insert(
+                    request_id.clone(),
+                    PendingRequest {
+                        state: Arc::clone(&state),
+                        cancelable: false,
+                    },
+                );
+                if job_tx
+                    .send(RuntimeJob::Dispatch {
+                        request,
+                        state,
+                        wait_trigger: None,
+                    })
+                    .is_err()
+                {
+                    pending.remove(&request_id);
+                    return Err(io::Error::other("runtime worker stopped"));
+                }
+            }
+            CoordinatorEvent::Completed {
+                request_id,
+                state,
+                response,
+                shutdown,
+            } => {
+                if pending
+                    .get(&request_id)
+                    .is_some_and(|pending| Arc::ptr_eq(&pending.state, &state))
+                {
+                    pending.remove(&request_id);
+                }
+                write_response(&mut writer, response)?;
+                if shutdown {
+                    cancel_all_requests(&mut pending, &mut writer)?;
+                    return Ok(());
+                }
+                if input_closed && pending.is_empty() {
+                    return Ok(());
+                }
+            }
+            CoordinatorEvent::FrameTooLarge => {
+                write_response(
+                    &mut writer,
                     Response::error(None, "FRAME_TOO_LARGE", "JSONL frame exceeds maximum size"),
                 )?;
                 return Ok(());
             }
-            Err(FrameError::Io(error)) => return Err(error),
-        };
-        pending.retain(|_, state| state.load(Ordering::Acquire) == PENDING);
-
-        let request = match decode_request(&frame) {
-            Ok(request) => request,
-            Err(response) => {
-                write_shared_response(&writer, response)?;
-                continue;
+            CoordinatorEvent::InputClosed => {
+                input_closed = true;
+                cancel_all_waits(&mut pending, &mut writer)?;
+                if pending.is_empty() {
+                    return Ok(());
+                }
             }
-        };
-
-        if matches!(request.operation, Operation::Cancel) {
-            cancel_pending(request, &mut pending, &writer)?;
-            continue;
-        }
-        if matches!(request.operation, Operation::Sync)
-            && request.payload.get("wait_for_change_ms").is_some()
-        {
-            schedule_wait_sync(
-                request,
-                &mut pending,
-                Arc::clone(&runtime),
-                Arc::clone(&writer),
-            )?;
-            continue;
-        }
-
-        let (response, shutdown) = {
-            let mut runtime = runtime
-                .lock()
-                .map_err(|_| io::Error::other("runtime lock poisoned"))?;
-            let response = runtime.dispatch(request);
-            (response, runtime.should_shutdown())
-        };
-        write_shared_response(&writer, response)?;
-        if shutdown {
-            return Ok(());
+            CoordinatorEvent::ReadError(error) => return Err(error),
         }
     }
 }
 
-fn schedule_wait_sync<W: Write + Send + 'static>(
-    request: Request,
-    pending: &mut HashMap<String, Arc<AtomicU8>>,
+fn spawn_reader<R: Read + Send + 'static>(reader: R, events: mpsc::SyncSender<CoordinatorEvent>) {
+    thread::spawn(move || {
+        let mut reader = io::BufReader::new(reader);
+        loop {
+            let event = match read_frame(&mut reader) {
+                Ok(Some(frame)) => CoordinatorEvent::Frame(frame),
+                Ok(None) => CoordinatorEvent::InputClosed,
+                Err(FrameError::TooLarge) => CoordinatorEvent::FrameTooLarge,
+                Err(FrameError::Io(error)) => CoordinatorEvent::ReadError(error),
+            };
+            let terminal = !matches!(event, CoordinatorEvent::Frame(_));
+            if events.send(event).is_err() || terminal {
+                return;
+            }
+        }
+    });
+}
+
+fn spawn_runtime_worker(
     runtime: Arc<Mutex<runtime::Runtime>>,
-    writer: Arc<Mutex<W>>,
-) -> io::Result<()> {
-    let request_id = request.request_id;
-    let payload = match serde_json::from_value::<WaitSyncPayload>(request.payload) {
+    jobs: mpsc::Receiver<RuntimeJob>,
+    job_sender: mpsc::SyncSender<RuntimeJob>,
+    events: mpsc::SyncSender<CoordinatorEvent>,
+) {
+    thread::spawn(move || {
+        while let Ok(job) = jobs.recv() {
+            match job {
+                RuntimeJob::Dispatch {
+                    request,
+                    state,
+                    wait_trigger,
+                } => {
+                    if wait_trigger.is_some()
+                        && state
+                            .compare_exchange(
+                                PENDING,
+                                COMPLETING,
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            )
+                            .is_err()
+                    {
+                        continue;
+                    }
+                    let request_id = request.request_id.clone();
+                    let (mut response, shutdown) = match runtime.lock() {
+                        Ok(mut runtime) => {
+                            let response = runtime.dispatch(request);
+                            (response, runtime.should_shutdown())
+                        }
+                        Err(_) => (
+                            Response::error(
+                                Some(request_id.clone()),
+                                "INTERNAL_ERROR",
+                                "bridge runtime unavailable",
+                            ),
+                            false,
+                        ),
+                    };
+                    if response.ok {
+                        if let (Some(trigger), Some(Value::Object(result))) =
+                            (wait_trigger, response.result.as_mut())
+                        {
+                            result.insert("wait_trigger".to_owned(), serde_json::json!(trigger));
+                        }
+                    }
+                    state.store(DONE, Ordering::Release);
+                    if events
+                        .send(CoordinatorEvent::Completed {
+                            request_id,
+                            state,
+                            response,
+                            shutdown,
+                        })
+                        .is_err()
+                        || shutdown
+                    {
+                        return;
+                    }
+                }
+                RuntimeJob::RegisterWait {
+                    request_id,
+                    payload,
+                    state,
+                } => {
+                    if state.load(Ordering::Acquire) != PENDING {
+                        continue;
+                    }
+                    let updates = match runtime.lock() {
+                        Ok(runtime) => runtime.subscribe_updates(&payload.space_id),
+                        Err(_) => None,
+                    };
+                    let Some(updates) = updates else {
+                        if state
+                            .compare_exchange(PENDING, DONE, Ordering::AcqRel, Ordering::Acquire)
+                            .is_ok()
+                        {
+                            let _ = events.send(CoordinatorEvent::Completed {
+                                request_id: request_id.clone(),
+                                state,
+                                response: invalid_state_response(request_id),
+                                shutdown: false,
+                            });
+                        }
+                        continue;
+                    };
+                    spawn_waiter(
+                        request_id,
+                        payload,
+                        updates,
+                        Arc::clone(&runtime),
+                        job_sender.clone(),
+                        Arc::clone(&state),
+                    );
+                }
+            }
+        }
+    });
+}
+
+fn parse_wait_sync(request_id: &str, payload: Value) -> Result<WaitSyncPayload, Response> {
+    match serde_json::from_value::<WaitSyncPayload>(payload) {
         Ok(payload)
             if payload.wait_for_change_ms > 0
                 && payload.wait_for_change_ms <= MAX_WAIT_FOR_CHANGE_MS =>
         {
-            payload
+            Ok(payload)
         }
-        _ => {
-            return write_shared_response(
-                &writer,
-                Response::error(
-                    Some(request_id),
-                    "INVALID_REQUEST",
-                    "invalid bridge request",
-                ),
-            );
-        }
-    };
-    if pending.len() >= MAX_PENDING_REQUESTS || pending.contains_key(&request_id) {
-        return write_shared_response(
-            &writer,
-            Response::error(
-                Some(request_id),
-                "TOO_MANY_PENDING",
-                "pending bridge request limit reached",
-            ),
-        );
+        _ => Err(Response::error(
+            Some(request_id.to_owned()),
+            "INVALID_REQUEST",
+            "invalid bridge request",
+        )),
     }
+}
 
-    let state = Arc::new(AtomicU8::new(PENDING));
-    pending.insert(request_id.clone(), Arc::clone(&state));
+fn spawn_waiter(
+    request_id: String,
+    payload: WaitSyncPayload,
+    mut updates: tokio::sync::broadcast::Receiver<encrypted_spaces_sdk::BroadcastEvent>,
+    runtime: Arc<Mutex<runtime::Runtime>>,
+    jobs: mpsc::SyncSender<RuntimeJob>,
+    state: Arc<AtomicU8>,
+) {
     thread::spawn(move || {
-        thread::sleep(Duration::from_millis(payload.wait_for_change_ms));
-        if state
-            .compare_exchange(PENDING, COMPLETING, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
+        let deadline =
+            std::time::Instant::now() + Duration::from_millis(payload.wait_for_change_ms);
+        let trigger = loop {
+            if state.load(Ordering::Acquire) != PENDING {
+                return;
+            }
+            if let Ok(runtime) = runtime.try_lock() {
+                runtime.poll_background();
+            }
+            match updates.try_recv() {
+                Ok(_) | Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
+                    break "change";
+                }
+                Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break "closed",
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {}
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                break "timeout";
+            }
+            thread::sleep(WAIT_POLL_INTERVAL.min(deadline.saturating_duration_since(now)));
+        };
+        if state.load(Ordering::Acquire) != PENDING {
             return;
         }
-        let response = match runtime.lock() {
-            Ok(mut runtime) => runtime.dispatch(Request {
+        let _ = jobs.send(RuntimeJob::Dispatch {
+            request: Request {
                 version: PROTOCOL_VERSION,
                 request_id,
                 operation: Operation::Sync,
-                payload: json!({"space_id": payload.space_id}),
-            }),
-            Err(_) => return,
-        };
-        let _ = write_shared_response(&writer, response);
+                payload: serde_json::json!({"space_id": payload.space_id}),
+            },
+            state,
+            wait_trigger: Some(trigger),
+        });
     });
-    Ok(())
 }
 
 fn cancel_pending<W: Write>(
     request: Request,
-    pending: &mut HashMap<String, Arc<AtomicU8>>,
-    writer: &Arc<Mutex<W>>,
+    pending: &mut HashMap<String, PendingRequest>,
+    writer: &mut W,
 ) -> io::Result<()> {
+    if pending.contains_key(&request.request_id) {
+        return write_response(
+            writer,
+            Response::error(
+                None,
+                "DUPLICATE_REQUEST_ID",
+                "request ID is already pending",
+            ),
+        );
+    }
     let payload = match serde_json::from_value::<CancelPayload>(request.payload) {
         Ok(payload) if !payload.request_id.is_empty() => payload,
         _ => {
-            return write_shared_response(
+            return write_response(
                 writer,
                 Response::error(
                     Some(request.request_id),
@@ -231,17 +515,29 @@ fn cancel_pending<W: Write>(
             );
         }
     };
-    let canceled = pending.remove(&payload.request_id).is_some_and(|state| {
-        state
-            .compare_exchange(PENDING, CANCELED, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
+    if request.request_id == payload.request_id {
+        return write_response(
+            writer,
+            Response::error(
+                Some(request.request_id),
+                "INVALID_REQUEST",
+                "invalid bridge request",
+            ),
+        );
+    }
+    let canceled = pending.get(&payload.request_id).is_some_and(|pending| {
+        pending.cancelable
+            && pending
+                .state
+                .compare_exchange(PENDING, CANCELED, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
     });
-    let mut writer = writer
-        .lock()
-        .map_err(|_| io::Error::other("writer lock poisoned"))?;
+    if canceled {
+        pending.remove(&payload.request_id);
+    }
     if canceled {
         write_response(
-            &mut *writer,
+            writer,
             Response::error(
                 Some(payload.request_id),
                 "CANCELED",
@@ -250,16 +546,64 @@ fn cancel_pending<W: Write>(
         )?;
     }
     write_response(
-        &mut *writer,
+        writer,
         Response::success(request.request_id, CancelResult { canceled }),
     )
 }
 
-fn write_shared_response<W: Write>(writer: &Arc<Mutex<W>>, response: Response) -> io::Result<()> {
-    let mut writer = writer
-        .lock()
-        .map_err(|_| io::Error::other("writer lock poisoned"))?;
-    write_response(&mut *writer, response)
+fn cancel_all_waits<W: Write>(
+    pending: &mut HashMap<String, PendingRequest>,
+    writer: &mut W,
+) -> io::Result<()> {
+    let request_ids: Vec<_> = pending
+        .iter()
+        .filter(|(_, pending)| {
+            pending.cancelable
+                && pending
+                    .state
+                    .compare_exchange(PENDING, CANCELED, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+        })
+        .map(|(request_id, _)| request_id.clone())
+        .collect();
+    for request_id in request_ids {
+        pending.remove(&request_id);
+        write_response(
+            writer,
+            Response::error(Some(request_id), "CANCELED", "bridge request canceled"),
+        )?;
+    }
+    Ok(())
+}
+
+fn cancel_all_requests<W: Write>(
+    pending: &mut HashMap<String, PendingRequest>,
+    writer: &mut W,
+) -> io::Result<()> {
+    for (request_id, pending_request) in pending.drain() {
+        pending_request.state.store(CANCELED, Ordering::Release);
+        write_response(
+            writer,
+            Response::error(Some(request_id), "CANCELED", "bridge request canceled"),
+        )?;
+    }
+    Ok(())
+}
+
+fn invalid_state_response(request_id: String) -> Response {
+    Response::error(
+        Some(request_id),
+        "INVALID_STATE",
+        "operation is invalid for current bridge state",
+    )
+}
+
+fn invalid_state_response_optional(request_id: Option<String>) -> Response {
+    Response::error(
+        request_id,
+        "INVALID_STATE",
+        "operation is invalid for current bridge state",
+    )
 }
 
 fn decode_request(frame: &[u8]) -> Result<Request, Response> {
@@ -348,6 +692,14 @@ fn write_response<W: Write>(writer: &mut W, response: Response) -> io::Result<()
 
 fn encode_response(response: &Response) -> io::Result<Vec<u8>> {
     let mut frame = serde_json::to_vec(response).map_err(io::Error::other)?;
+    if frame.len() > MAX_FRAME_BYTES {
+        frame = serde_json::to_vec(&Response::error(
+            response.request_id.clone(),
+            "RESPONSE_TOO_LARGE",
+            "bridge response exceeds maximum size",
+        ))
+        .map_err(io::Error::other)?;
+    }
     frame.push(b'\n');
     Ok(frame)
 }
@@ -382,6 +734,19 @@ mod tests {
             encoded,
             b"{\"version\":1,\"request_id\":\"encode-request\",\"ok\":false,\"error\":{\"code\":\"INVALID_REQUEST\",\"message\":\"invalid bridge request\"}}\n"
         );
+    }
+
+    #[test]
+    fn protocol_encode_replaces_oversized_response_with_bounded_error() {
+        let response =
+            Response::success("oversized-response".to_owned(), "x".repeat(MAX_FRAME_BYTES));
+
+        let encoded = encode_response(&response).expect("encode bounded response");
+        assert!(encoded.len() <= MAX_FRAME_BYTES + 1);
+        let value: Value = serde_json::from_slice(&encoded).expect("bounded response JSON");
+        assert_eq!(value["request_id"], "oversized-response");
+        assert_eq!(value["ok"], false);
+        assert_eq!(value["error"]["code"], "RESPONSE_TOO_LARGE");
     }
 
     #[test]

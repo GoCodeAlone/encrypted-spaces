@@ -510,6 +510,7 @@ mod tests {
     use crate::local_transport::LocalTransport;
     use crate::schema::Schema;
     use crate::users::UserStatus;
+    use encrypted_spaces_acl_types::{Action, ActionLeg};
     use encrypted_spaces_backend::error::Result;
     use encrypted_spaces_backend::schema_kdl::parse_schema_bundle;
     use encrypted_spaces_backend::sign_change::sign_change;
@@ -559,6 +560,94 @@ mod tests {
         let transport = LocalTransport::in_memory().await?;
         let space = Space::create(transport.clone(), schema()).await?;
         Ok((transport, space))
+    }
+
+    #[tokio::test]
+    async fn trusted_restore_rejects_snapshot_with_different_trust_bundle() -> Result<()> {
+        let (transport, space) = create_space().await?;
+        let snapshot = space.snapshot().await?;
+        let initial_dc = crate::testing::initial_internal_data_commitment();
+        let foreign_schema = SchemaBuilder::new("foreign")
+            .column("id", ColumnType::Integer)
+            .plaintext_primary_key()
+            .build()?;
+        let mismatches = [
+            ApplicationSchema::WithDataCommitment(vec![], [0xA5; 32], EXTEND_FF_ID),
+            ApplicationSchema::WithDataCommitment(vec![], initial_dc, [0x5A5A5A5A; 8]),
+            ApplicationSchema::WithDataCommitment(vec![foreign_schema], initial_dc, EXTEND_FF_ID),
+        ];
+
+        for mismatched in mismatches {
+            let result =
+                Space::restore_trusted(transport.clone(), snapshot.clone(), mismatched).await;
+            let error = match result {
+                Ok(_) => panic!("trusted restore accepted a foreign trust bundle"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("snapshot trust bundle mismatch"));
+        }
+
+        let mut action_snapshot = snapshot.clone();
+        let foreign_action = Action {
+            name: "foreign_action".to_owned(),
+            legs: vec![ActionLeg::Insert {
+                table: "foreign".to_owned(),
+            }],
+            asserts: Vec::new(),
+        };
+        action_snapshot["state"]["actions"] = serde_json::json!({
+            foreign_action.name.clone(): foreign_action,
+        });
+        let action_error = match Space::restore_trusted(
+            transport.clone(),
+            action_snapshot,
+            ApplicationSchema::WithDataCommitment(vec![], initial_dc, EXTEND_FF_ID),
+        )
+        .await
+        {
+            Ok(_) => panic!("trusted restore accepted snapshot-defined actions"),
+            Err(error) => error,
+        };
+        assert!(action_error
+            .to_string()
+            .contains("snapshot trust bundle mismatch"));
+
+        let mut mismatched_space_id = snapshot.clone();
+        mismatched_space_id["state"]["auth_context"]["space_id"] =
+            serde_json::to_value(encrypted_spaces_backend::SpaceId::random())?;
+        let id_error = match Space::restore_trusted(
+            transport.clone(),
+            mismatched_space_id,
+            ApplicationSchema::WithDataCommitment(vec![], initial_dc, EXTEND_FF_ID),
+        )
+        .await
+        {
+            Ok(_) => panic!("trusted restore accepted mismatched snapshot Space IDs"),
+            Err(error) => error,
+        };
+        assert!(id_error
+            .to_string()
+            .contains("snapshot trust bundle mismatch"));
+
+        let mut missing_space_id = snapshot;
+        missing_space_id
+            .as_object_mut()
+            .expect("snapshot object")
+            .remove("space_id");
+        let missing_id_error = match Space::restore_trusted(
+            transport,
+            missing_space_id,
+            ApplicationSchema::WithDataCommitment(vec![], initial_dc, EXTEND_FF_ID),
+        )
+        .await
+        {
+            Ok(_) => panic!("trusted restore accepted a snapshot without a Space ID"),
+            Err(error) => error,
+        };
+        assert!(missing_id_error
+            .to_string()
+            .contains("snapshot trust bundle mismatch"));
+        Ok(())
     }
 
     fn changelog_anchor_bytes(space: &Space) -> Option<Vec<u8>> {

@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 const MAX_FRAME_BYTES: usize = 64 * 1024;
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
 const EXIT_TIMEOUT: Duration = Duration::from_secs(2);
-const DEFAULT_ACTOR_ID: &str = "configured-test-actor";
+const DEFAULT_CLIENT_LABEL: &str = "configured-test-client";
 type StderrCapture = Arc<Mutex<Option<Result<Vec<u8>, String>>>>;
 
 enum StdoutEvent {
@@ -27,9 +27,9 @@ struct Bridge {
 }
 
 impl Bridge {
-    fn spawn(actor_id: &str) -> Self {
+    fn spawn(client_label: &str) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_encrypted-spaces-bridge"))
-            .env("ENCRYPTED_SPACES_ACTOR_ID", actor_id)
+            .env("ENCRYPTED_SPACES_CLIENT_LABEL", client_label)
             .env(
                 "ENCRYPTED_SPACES_SCHEMA_PATH",
                 concat!(env!("CARGO_MANIFEST_DIR"), "/../demos/tauri/app_schema.kdl"),
@@ -202,26 +202,27 @@ fn assert_future_success(response: &Value, operation: &str) {
 }
 
 #[test]
-fn protocol_hello_reports_process_configured_actor() {
-    for actor_id in ["configured-actor-one", "configured-actor-two"] {
-        let mut bridge = Bridge::spawn(actor_id);
+fn protocol_hello_reports_process_configured_client_label() {
+    for client_label in ["configured-client-one", "configured-client-two"] {
+        let mut bridge = Bridge::spawn(client_label);
         bridge.send_request("hello-request", "hello", json!({}));
         let response = bridge.receive();
         assert_future_success(&response, "hello");
-        assert_eq!(response["result"]["actor_id"], actor_id);
+        assert_eq!(response["result"]["client_label"], client_label);
+        assert!(response["result"].get("actor_id").is_none());
     }
 }
 
 #[test]
 fn protocol_version_reports_bridge_contract() {
-    let mut bridge = Bridge::spawn(DEFAULT_ACTOR_ID);
+    let mut bridge = Bridge::spawn(DEFAULT_CLIENT_LABEL);
     bridge.send_request("version-request", "version", json!({}));
     assert_future_success(&bridge.receive(), "version");
 }
 
 #[test]
 fn protocol_request_supplied_actor_id_is_rejected() {
-    let mut bridge = Bridge::spawn(DEFAULT_ACTOR_ID);
+    let mut bridge = Bridge::spawn(DEFAULT_CLIENT_LABEL);
     let frame = serde_json::to_string(&json!({
         "version": 1,
         "request_id": "actor-in-frame",
@@ -242,7 +243,7 @@ fn protocol_request_supplied_actor_id_is_rejected() {
 #[test]
 fn protocol_bare_space_lifecycle_names_are_unknown() {
     for operation in ["create", "join", "snapshot", "restore", "sync"] {
-        let mut bridge = Bridge::spawn(DEFAULT_ACTOR_ID);
+        let mut bridge = Bridge::spawn(DEFAULT_CLIENT_LABEL);
         bridge.send_request("bare-operation", operation, json!({}));
         let response = bridge.receive();
         assert_eq!(
@@ -255,7 +256,7 @@ fn protocol_bare_space_lifecycle_names_are_unknown() {
 
 #[test]
 fn protocol_malformed_frame_has_stable_error() {
-    let mut bridge = Bridge::spawn(DEFAULT_ACTOR_ID);
+    let mut bridge = Bridge::spawn(DEFAULT_CLIENT_LABEL);
     bridge.send_raw(b"not-json\n");
     let response = bridge.receive();
     assert_eq!(response["ok"], false);
@@ -265,7 +266,7 @@ fn protocol_malformed_frame_has_stable_error() {
 
 #[test]
 fn protocol_accepts_a_frame_at_the_exact_limit() {
-    let mut bridge = Bridge::spawn(DEFAULT_ACTOR_ID);
+    let mut bridge = Bridge::spawn(DEFAULT_CLIENT_LABEL);
     bridge.send_raw(exact_size_request(MAX_FRAME_BYTES).as_bytes());
     let response = bridge.receive();
     assert_eq!(response["request_id"], "exact-max");
@@ -274,7 +275,7 @@ fn protocol_accepts_a_frame_at_the_exact_limit() {
 
 #[test]
 fn protocol_oversize_error_is_prompt_while_stdin_remains_open() {
-    let mut bridge = Bridge::spawn(DEFAULT_ACTOR_ID);
+    let mut bridge = Bridge::spawn(DEFAULT_CLIENT_LABEL);
     bridge.send_raw(&vec![b'x'; MAX_FRAME_BYTES + 1]);
 
     let response = bridge.receive();
@@ -288,7 +289,7 @@ fn protocol_oversize_error_is_prompt_while_stdin_remains_open() {
 
 #[test]
 fn protocol_process_terminates_after_oversize_without_draining_stdin() {
-    let mut bridge = Bridge::spawn(DEFAULT_ACTOR_ID);
+    let mut bridge = Bridge::spawn(DEFAULT_CLIENT_LABEL);
     bridge.send_raw(&vec![b'x'; MAX_FRAME_BYTES + 1]);
     assert_eq!(bridge.receive()["error"]["code"], "FRAME_TOO_LARGE");
 
@@ -298,7 +299,7 @@ fn protocol_process_terminates_after_oversize_without_draining_stdin() {
 
 #[test]
 fn protocol_recovers_in_malformed_invalid_valid_order() {
-    let mut bridge = Bridge::spawn(DEFAULT_ACTOR_ID);
+    let mut bridge = Bridge::spawn(DEFAULT_CLIENT_LABEL);
     bridge.send_raw(b"not-json\n");
     let invalid = serde_json::to_string(&json!({
         "version": 2,
@@ -323,7 +324,7 @@ fn protocol_recovers_in_malformed_invalid_valid_order() {
 
 #[test]
 fn protocol_validation_error_preserves_request_id() {
-    let mut bridge = Bridge::spawn(DEFAULT_ACTOR_ID);
+    let mut bridge = Bridge::spawn(DEFAULT_CLIENT_LABEL);
     let frame = serde_json::to_string(&json!({
         "version": 2,
         "request_id": "unsupported-version",
@@ -341,7 +342,7 @@ fn protocol_validation_error_preserves_request_id() {
 
 #[test]
 fn protocol_invalid_oversized_request_id_is_not_reflected() {
-    let mut bridge = Bridge::spawn(DEFAULT_ACTOR_ID);
+    let mut bridge = Bridge::spawn(DEFAULT_CLIENT_LABEL);
     let oversized_request_id = "x".repeat(257);
     let frame = serde_json::to_string(&json!({
         "version": 1,
@@ -360,7 +361,7 @@ fn protocol_invalid_oversized_request_id_is_not_reflected() {
 
 #[test]
 fn protocol_unknown_operation_is_distinct_from_malformed_json() {
-    let mut bridge = Bridge::spawn(DEFAULT_ACTOR_ID);
+    let mut bridge = Bridge::spawn(DEFAULT_CLIENT_LABEL);
     bridge.send_request("unknown-request", "space.unknown", json!({}));
     bridge.send_raw(b"{not-json}\n");
 
@@ -372,39 +373,29 @@ fn protocol_unknown_operation_is_distinct_from_malformed_json() {
 }
 
 #[test]
-fn protocol_cancellation_interrupts_sync_and_keeps_process_usable() {
-    let mut bridge = Bridge::spawn(DEFAULT_ACTOR_ID);
-    bridge.send_request("hello-before-cancel", "hello", json!({}));
+fn protocol_wait_without_active_space_is_rejected_and_process_stays_usable() {
+    let mut bridge = Bridge::spawn(DEFAULT_CLIENT_LABEL);
+    bridge.send_request("hello-before-invalid-wait", "hello", json!({}));
     assert_future_success(&bridge.receive(), "hello");
 
     bridge.send_request(
-        "sync-to-cancel",
+        "invalid-wait",
         "space.sync",
         json!({"space_id": "cancel-contract-space", "wait_for_change_ms": 30_000}),
     );
-    bridge.send_request(
-        "cancel-request",
-        "cancel",
-        json!({"request_id": "sync-to-cancel"}),
-    );
+    let rejected = bridge.receive();
+    assert_eq!(rejected["request_id"], "invalid-wait");
+    assert_eq!(rejected["ok"], false);
+    assert_eq!(rejected["error"]["code"], "INVALID_STATE");
 
-    let canceled = bridge.receive();
-    assert_eq!(canceled["request_id"], "sync-to-cancel");
-    assert_eq!(canceled["ok"], false);
-    assert_eq!(canceled["error"]["code"], "CANCELED");
-
-    let cancel_ack = bridge.receive();
-    assert_eq!(cancel_ack["request_id"], "cancel-request");
-    assert_eq!(cancel_ack["ok"], true);
-
-    bridge.send_request("version-after-cancel", "version", json!({}));
-    assert_future_success(&bridge.receive(), "version after cancel");
+    bridge.send_request("version-after-invalid-wait", "version", json!({}));
+    assert_future_success(&bridge.receive(), "version after invalid wait");
 }
 
 #[test]
 fn protocol_validation_errors_redact_secret_material() {
     let secret = "request-secret-value";
-    let mut bridge = Bridge::spawn(DEFAULT_ACTOR_ID);
+    let mut bridge = Bridge::spawn(DEFAULT_CLIENT_LABEL);
     let frame = serde_json::to_string(&json!({
         "version": 2,
         "request_id": "secret-validation",
@@ -430,7 +421,7 @@ fn protocol_validation_errors_redact_secret_material() {
 #[test]
 fn protocol_runtime_sdk_errors_are_deterministic_and_redacted() {
     let secrets = ["runtime-secret-alpha", "runtime-secret-beta"];
-    let mut bridge = Bridge::spawn(DEFAULT_ACTOR_ID);
+    let mut bridge = Bridge::spawn(DEFAULT_CLIENT_LABEL);
 
     for (index, secret) in secrets.iter().enumerate() {
         bridge.send_request(
@@ -467,7 +458,7 @@ fn protocol_runtime_sdk_errors_are_deterministic_and_redacted() {
 
 #[test]
 fn protocol_close_clears_state_and_keeps_process_usable() {
-    let mut bridge = Bridge::spawn(DEFAULT_ACTOR_ID);
+    let mut bridge = Bridge::spawn(DEFAULT_CLIENT_LABEL);
     bridge.send_request("close-request", "close", json!({}));
     let close = bridge.receive();
     assert_future_success(&close, "close");
@@ -479,7 +470,7 @@ fn protocol_close_clears_state_and_keeps_process_usable() {
 
 #[test]
 fn protocol_shutdown_acknowledges_and_exits() {
-    let mut bridge = Bridge::spawn(DEFAULT_ACTOR_ID);
+    let mut bridge = Bridge::spawn(DEFAULT_CLIENT_LABEL);
     bridge.send_request("shutdown-request", "shutdown", json!({}));
     let shutdown = bridge.receive();
     assert_future_success(&shutdown, "shutdown");
@@ -490,7 +481,7 @@ fn protocol_shutdown_acknowledges_and_exits() {
 
 #[test]
 fn protocol_process_exits_after_stdin_eof() {
-    let mut bridge = Bridge::spawn(DEFAULT_ACTOR_ID);
+    let mut bridge = Bridge::spawn(DEFAULT_CLIENT_LABEL);
     bridge.close_stdin();
     let status = bridge.wait_for_exit();
     assert!(status.success(), "bridge exited with {status}");

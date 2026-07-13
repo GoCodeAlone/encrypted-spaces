@@ -9,5 +9,5 @@ fn main() -> std::io::Result<()> {
         println!("encrypted-spaces-bridge {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
-    protocol::run(std::io::stdin().lock(), std::io::stdout())
+    protocol::run(std::io::stdin(), std::io::stdout())
 }
